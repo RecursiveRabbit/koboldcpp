@@ -13,6 +13,12 @@
 #include <cmath>
 #include <cstring>
 
+// External attention capture callback (defined in gpttype_adapter.cpp)
+extern void attention_capture_callback(const llama_ubatch & ubatch,
+                                      ggml_tensor * cur,
+                                      const char * name,
+                                      int il);
+
 void llm_graph_input_embd::set_input(const llama_ubatch * ubatch) {
     if (ubatch->token) {
         const int64_t n_tokens = ubatch->n_tokens;
@@ -598,6 +604,8 @@ void llm_graph_context::cb(ggml_tensor * cur, const char * name, int il) const {
     if (cb_func) {
         cb_func(ubatch, cur, name, il);
     }
+    // Also call our global attention capture callback
+    attention_capture_callback(ubatch, cur, name, il);
 }
 
 ggml_tensor * llm_graph_context::build_cvec(

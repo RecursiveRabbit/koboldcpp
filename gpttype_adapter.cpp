@@ -148,6 +148,122 @@ static bool highpriority = false;
 
 static int delayed_generated_tokens_limit = 0;
 std::deque<std::string> delayed_generated_tokens; //for use with antislop sampling
+
+// ============================================================================
+// ATTENTION CAPTURE SYSTEM (for Halo Weave)
+// ============================================================================
+struct AttentionCapture {
+    float* buffer;                  // Pre-allocated static buffer
+    size_t buffer_capacity;         // Max floats we can store
+    size_t buffer_used;             // Floats written this request
+    int n_layers_captured;          // Layers captured so far
+    int n_heads;                    // Heads per layer
+    int seq_len;                    // Context length
+    bool enabled;                   // Capture flag for this request
+
+    void init(int max_heads, int max_ctx, int max_layers) {
+        buffer_capacity = (size_t)max_heads * max_ctx * max_layers;
+        buffer = (float*)malloc(buffer_capacity * sizeof(float));
+        if (buffer == nullptr) {
+            fprintf(stderr, "ERROR: Failed to allocate attention buffer (%zu MB)\n",
+                    buffer_capacity * sizeof(float) / (1024*1024));
+            buffer_capacity = 0;
+        }
+        reset();
+    }
+
+    void reset() {
+        buffer_used = 0;
+        n_layers_captured = 0;
+        n_heads = 0;
+        seq_len = 0;
+        enabled = false;
+    }
+
+    void append_layer(const float* data, int heads, int len) {
+        size_t count = (size_t)heads * len;
+        if (buffer_used + count > buffer_capacity) {
+            fprintf(stderr, "WARNING: Attention buffer overflow (used %zu, capacity %zu)\n",
+                    buffer_used + count, buffer_capacity);
+            return;
+        }
+        memcpy(buffer + buffer_used, data, count * sizeof(float));
+        buffer_used += count;
+        n_layers_captured++;
+        if (n_heads == 0) n_heads = heads;  // Set once
+        if (seq_len == 0) seq_len = len;    // Set once
+    }
+
+    void free_buffer() {
+        if (buffer) {
+            free(buffer);
+            buffer = nullptr;
+        }
+        buffer_capacity = 0;
+        reset();
+    }
+};
+
+static AttentionCapture g_attention;  // Global, reused across requests
+
+// Callback to capture attention weights during graph execution
+void attention_capture_callback(const llama_ubatch & ubatch,
+                                ggml_tensor * cur,
+                                const char * name,
+                                int il) {
+    // Only capture if enabled and this is the softmax attention tensor
+    if (!g_attention.enabled || strcmp(name, "kq_soft_max") != 0) {
+        return;
+    }
+
+    // Tensor shape: [seq_len_k, n_heads, seq_len_q, n_stream]
+    // During generation: [seq_len_k, n_heads, 1, 1]
+    int64_t seq_len_k = cur->ne[0];  // KV cache length
+    int64_t n_heads = cur->ne[1];
+    int64_t seq_len_q = cur->ne[2];  // Query length (typically 1)
+    int64_t n_stream = cur->ne[3];   // Batch size (typically 1)
+
+    // Only handle single-token generation for now
+    if (seq_len_q != 1 || n_stream != 1) {
+        return;
+    }
+
+    // Calculate tensor size
+    size_t tensor_elements = seq_len_k * n_heads * seq_len_q * n_stream;
+    size_t tensor_bytes = tensor_elements * sizeof(float);
+
+    // Allocate temporary buffer for GPU->CPU copy
+    float* temp = (float*)malloc(tensor_bytes);
+    if (temp == nullptr) {
+        fprintf(stderr, "ERROR: Failed to allocate temp buffer for attention copy\n");
+        return;
+    }
+
+    // Copy attention tensor from GPU/backend to CPU
+    ggml_backend_tensor_get(cur, temp, 0, tensor_bytes);
+
+    // Data layout is [seq_len_k, n_heads, 1, 1]
+    // We want [n_heads, seq_len_k] for easier processing
+    // Reshape: transpose from [seq_len_k, n_heads] to [n_heads, seq_len_k]
+    float* transposed = (float*)malloc(tensor_elements * sizeof(float));
+    if (transposed == nullptr) {
+        free(temp);
+        fprintf(stderr, "ERROR: Failed to allocate transposed buffer\n");
+        return;
+    }
+
+    for (int h = 0; h < n_heads; h++) {
+        for (int s = 0; s < seq_len_k; s++) {
+            transposed[h * seq_len_k + s] = temp[s * n_heads + h];
+        }
+    }
+
+    // Append to global buffer
+    g_attention.append_layer(transposed, n_heads, seq_len_k);
+
+    free(transposed);
+    free(temp);
+}
 static std::map<int,std::vector<int>> antislop_banned_token_ids; //first is the npast position, second is the array of banned ids at that index
 
 const int savestate_limit = 3;
@@ -2577,6 +2693,21 @@ ModelLoadResult gpttype_load_model(const load_model_inputs inputs, FileFormat in
         {
             printf("\nModel Warmup Failed! (code:%d)\n",er);
         }
+
+        // Initialize attention capture buffer
+        int n_layer = llama_n_layer(llamamodel);
+        int n_head = llama_n_head(llamamodel);
+        int n_ctx_max = llama_n_ctx(llama_ctx_v4);
+        printf("Initializing attention capture buffer (max: %d heads, %d ctx, %d layers)...\n",
+               n_head, n_ctx_max, n_layer);
+        g_attention.init(n_head, n_ctx_max, n_layer);
+        if (g_attention.buffer == nullptr) {
+            fprintf(stderr, "WARNING: Attention capture disabled due to allocation failure\n");
+        } else {
+            printf("Attention buffer allocated: %.1f MB\n",
+                   (g_attention.buffer_capacity * sizeof(float)) / (1024.0 * 1024.0));
+        }
+
         return ModelLoadResult::SUCCESS;
     }
     else if (file_format == FileFormat::RWKV_1 || file_format==FileFormat::RWKV_2)
@@ -3217,6 +3348,10 @@ generation_outputs gpttype_generate(const generation_inputs inputs)
     dry_max_token_repeat.clear();
     top_picks_history.clear();
     early_abort = false;
+
+    // Reset and enable attention capture if requested
+    g_attention.reset();
+    g_attention.enabled = inputs.output_attentions;
 
     double time0 = 0, time1 = 0, time2 = 0;
     timer_start();
@@ -4628,6 +4763,20 @@ generation_outputs gpttype_generate(const generation_inputs inputs)
     concat_output_reader_copy_res = concat_output;
     concat_output_mtx.unlock();
     output.text = concat_output_reader_copy_res.c_str();
+
+    // Copy attention weights to output if capture was enabled
+    if (g_attention.enabled && g_attention.buffer_used > 0) {
+        output.attention_weights = g_attention.buffer;
+        output.attention_n_layers = g_attention.n_layers_captured;
+        output.attention_n_heads = g_attention.n_heads;
+        output.attention_seq_len = g_attention.seq_len;
+    } else {
+        output.attention_weights = nullptr;
+        output.attention_n_layers = 0;
+        output.attention_n_heads = 0;
+        output.attention_seq_len = 0;
+    }
+
     generation_finished = true;
     return output;
 }

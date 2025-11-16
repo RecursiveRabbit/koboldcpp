@@ -131,6 +131,7 @@ struct generation_inputs
     const logit_bias * logit_biases = nullptr;
     const int banned_tokens_len = 0;
     const char ** banned_tokens = nullptr;
+    const bool output_attentions = false;
 };
 struct generation_outputs
 {
@@ -139,6 +140,10 @@ struct generation_outputs
     int prompt_tokens = 0;
     int completion_tokens = 0;
     const char * text; //response will now be stored in c++ allocated memory
+    const float * attention_weights = nullptr;  // [n_layers, n_heads, seq_len]
+    int attention_n_layers = 0;
+    int attention_n_heads = 0;
+    int attention_seq_len = 0;
 };
 struct token_count_outputs
 {
