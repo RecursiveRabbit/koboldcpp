@@ -145,6 +145,14 @@ struct generation_outputs
     int attention_n_heads = 0;
     int attention_seq_len = 0;
 };
+struct attention_outputs
+{
+    const float * data = nullptr;  // Pointer to attention buffer [n_layers, n_heads, seq_len]
+    int n_layers = 0;
+    int n_heads = 0;
+    int seq_len = 0;
+    bool valid = false;  // True if attention data is available
+};
 struct token_count_outputs
 {
     int count = 0;

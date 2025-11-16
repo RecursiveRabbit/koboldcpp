@@ -219,6 +219,40 @@ extern "C"
         return gpttype_generate(inputs);
     }
 
+    attention_outputs get_token_attention(int idx)
+    {
+        attention_outputs output;
+
+        // Validate index
+        if (generated_tokens.size() <= idx || idx < 0) {
+            output.data = nullptr;
+            output.n_layers = 0;
+            output.n_heads = 0;
+            output.seq_len = 0;
+            output.valid = false;
+            return output;
+        }
+
+        // Get token with attention data (PUSH MODEL: data was captured atomically)
+        const TokenWithAttention& token_data = generated_tokens[idx];
+
+        if (token_data.has_attention) {
+            output.data = token_data.attention_data.data();
+            output.n_layers = token_data.n_layers;
+            output.n_heads = token_data.n_heads;
+            output.seq_len = token_data.seq_len;
+            output.valid = true;
+        } else {
+            output.data = nullptr;
+            output.n_layers = 0;
+            output.n_heads = 0;
+            output.seq_len = 0;
+            output.valid = false;
+        }
+
+        return output;
+    }
+
     bool sd_load_model(const sd_load_model_inputs inputs)
     {
         return sdtype_load_model(inputs);
@@ -258,7 +292,7 @@ extern "C"
     const char * new_token(int idx) {
         if (generated_tokens.size() <= idx || idx < 0) return nullptr;
 
-        return generated_tokens[idx].c_str();
+        return generated_tokens[idx].token_text.c_str();
     }
 
     int get_stream_count() {

@@ -265,14 +265,26 @@ class generation_inputs(ctypes.Structure):
                 ("logit_biases_len", ctypes.c_int),
                 ("logit_biases", ctypes.POINTER(logit_bias)),
                 ("banned_tokens_len", ctypes.c_int),
-                ("banned_tokens", ctypes.POINTER(ctypes.c_char_p))]
+                ("banned_tokens", ctypes.POINTER(ctypes.c_char_p)),
+                ("output_attentions", ctypes.c_bool)]
 
 class generation_outputs(ctypes.Structure):
     _fields_ = [("status", ctypes.c_int),
                 ("stopreason", ctypes.c_int),
                 ("prompt_tokens", ctypes.c_int),
                 ("completion_tokens", ctypes.c_int),
-                ("text", ctypes.c_char_p)]
+                ("text", ctypes.c_char_p),
+                ("attention_weights", ctypes.POINTER(ctypes.c_float)),
+                ("attention_n_layers", ctypes.c_int),
+                ("attention_n_heads", ctypes.c_int),
+                ("attention_seq_len", ctypes.c_int)]
+
+class attention_outputs(ctypes.Structure):
+    _fields_ = [("data", ctypes.POINTER(ctypes.c_float)),
+                ("n_layers", ctypes.c_int),
+                ("n_heads", ctypes.c_int),
+                ("seq_len", ctypes.c_int),
+                ("valid", ctypes.c_bool)]
 
 class sd_load_model_inputs(ctypes.Structure):
     _fields_ = [("model_filename", ctypes.c_char_p),
@@ -554,6 +566,8 @@ def init_library():
     handle.load_model.restype = ctypes.c_bool
     handle.generate.argtypes = [generation_inputs]
     handle.generate.restype = generation_outputs
+    handle.get_token_attention.argtypes = [ctypes.c_int]
+    handle.get_token_attention.restype = attention_outputs
     handle.new_token.restype = ctypes.c_char_p
     handle.new_token.argtypes = [ctypes.c_int]
     handle.get_stream_count.restype = ctypes.c_int
