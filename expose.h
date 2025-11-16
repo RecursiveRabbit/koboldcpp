@@ -153,6 +153,41 @@ struct attention_outputs
     int seq_len = 0;
     bool valid = false;  // True if attention data is available
 };
+
+// Forward declarations for attention capture system
+struct AttentionCapture {
+    float* buffer = nullptr;
+    size_t buffer_capacity = 0;
+    size_t buffer_used = 0;
+    int n_layers_captured = 0;
+    int n_heads = 0;
+    int seq_len = 0;
+    bool enabled = false;
+
+    void init(int max_heads, int max_ctx, int max_layers);
+    void reset();
+    void append_layer(const float* data, int heads, int len);
+    void free_buffer();
+};
+
+struct TokenWithAttention {
+    std::string token_text;
+    std::vector<float> attention_data;
+    int n_layers = 0;
+    int n_heads = 0;
+    int seq_len = 0;
+    bool has_attention = false;
+
+    // Default constructor for resize() operations
+    TokenWithAttention() = default;
+
+    // Constructor for tokens without attention
+    TokenWithAttention(const std::string& text);
+
+    // Constructor for tokens with attention (copies from AttentionCapture buffer)
+    TokenWithAttention(const std::string& text, const AttentionCapture& attention_src);
+};
+
 struct token_count_outputs
 {
     int count = 0;
@@ -314,7 +349,7 @@ extern std::string executable_path;
 extern std::string lora_filename;
 extern std::string mmproj_filename;
 extern std::string draftmodel_filename;
-extern std::vector<std::string> generated_tokens;
+extern std::vector<TokenWithAttention> generated_tokens;
 extern bool generation_finished;
 extern bool audio_multimodal_supported;
 extern bool vision_multimodal_supported;

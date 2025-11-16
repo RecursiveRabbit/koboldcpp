@@ -46,94 +46,72 @@
 #include "common/common.h"
 
 // ============================================================================
-// ATTENTION CAPTURE SYSTEM STRUCTS (for Halo Weave)
-// Defined early so they can be used in global variable declarations
+// ATTENTION CAPTURE SYSTEM IMPLEMENTATIONS (for Halo Weave)
+// Struct declarations are in expose.h
 // ============================================================================
 
-struct AttentionCapture {
-    float* buffer;                  // Pre-allocated static buffer
-    size_t buffer_capacity;         // Max floats we can store
-    size_t buffer_used;             // Floats written this request
-    int n_layers_captured;          // Layers captured so far
-    int n_heads;                    // Heads per layer
-    int seq_len;                    // Context length
-    bool enabled;                   // Capture flag for this request
-
-    void init(int max_heads, int max_ctx, int max_layers) {
-        buffer_capacity = (size_t)max_heads * max_ctx * max_layers;
-        buffer = (float*)malloc(buffer_capacity * sizeof(float));
-        if (buffer == nullptr) {
-            fprintf(stderr, "ERROR: Failed to allocate attention buffer (%zu MB)\n",
-                    buffer_capacity * sizeof(float) / (1024*1024));
-            buffer_capacity = 0;
-        }
-        reset();
-    }
-
-    void reset() {
-        buffer_used = 0;
-        n_layers_captured = 0;
-        n_heads = 0;
-        seq_len = 0;
-        enabled = false;
-    }
-
-    void append_layer(const float* data, int heads, int len) {
-        size_t count = (size_t)heads * len;
-        if (buffer_used + count > buffer_capacity) {
-            fprintf(stderr, "WARNING: Attention buffer overflow (used %zu, capacity %zu)\n",
-                    buffer_used + count, buffer_capacity);
-            return;
-        }
-        memcpy(buffer + buffer_used, data, count * sizeof(float));
-        buffer_used += count;
-        n_layers_captured++;
-        if (n_heads == 0) n_heads = heads;  // Set once
-        if (seq_len == 0) seq_len = len;    // Set once
-    }
-
-    void free_buffer() {
-        if (buffer) {
-            free(buffer);
-            buffer = nullptr;
-        }
+void AttentionCapture::init(int max_heads, int max_ctx, int max_layers) {
+    buffer_capacity = (size_t)max_heads * max_ctx * max_layers;
+    buffer = (float*)malloc(buffer_capacity * sizeof(float));
+    if (buffer == nullptr) {
+        fprintf(stderr, "ERROR: Failed to allocate attention buffer (%zu MB)\n",
+                buffer_capacity * sizeof(float) / (1024*1024));
         buffer_capacity = 0;
-        reset();
     }
-};
+    reset();
+}
 
-// Struct to pair generated tokens with their attention data
-// PUSH MODEL: Attention is captured atomically when token completes
-struct TokenWithAttention {
-    std::string token_text;
-    std::vector<float> attention_data;  // Copy of attention buffer at token completion
-    int n_layers = 0;
-    int n_heads = 0;
-    int seq_len = 0;
-    bool has_attention = false;
+void AttentionCapture::reset() {
+    buffer_used = 0;
+    n_layers_captured = 0;
+    n_heads = 0;
+    seq_len = 0;
+    enabled = false;
+}
 
-    // Constructor for tokens without attention
-    TokenWithAttention(const std::string& text)
-        : token_text(text), has_attention(false) {}
-
-    // Constructor for tokens with attention (copies from AttentionCapture buffer)
-    TokenWithAttention(const std::string& text, const AttentionCapture& attention_src)
-        : token_text(text) {
-        if (attention_src.enabled && attention_src.buffer_used > 0) {
-            // Copy attention data from static buffer BEFORE next token overwrites it
-            attention_data.assign(
-                attention_src.buffer,
-                attention_src.buffer + attention_src.buffer_used
-            );
-            n_layers = attention_src.n_layers_captured;
-            n_heads = attention_src.n_heads;
-            seq_len = attention_src.seq_len;
-            has_attention = true;
-        } else {
-            has_attention = false;
-        }
+void AttentionCapture::append_layer(const float* data, int heads, int len) {
+    size_t count = (size_t)heads * len;
+    if (buffer_used + count > buffer_capacity) {
+        fprintf(stderr, "WARNING: Attention buffer overflow (used %zu, capacity %zu)\n",
+                buffer_used + count, buffer_capacity);
+        return;
     }
-};
+    memcpy(buffer + buffer_used, data, count * sizeof(float));
+    buffer_used += count;
+    n_layers_captured++;
+    if (n_heads == 0) n_heads = heads;  // Set once
+    if (seq_len == 0) seq_len = len;    // Set once
+}
+
+void AttentionCapture::free_buffer() {
+    if (buffer) {
+        free(buffer);
+        buffer = nullptr;
+    }
+    buffer_capacity = 0;
+    reset();
+}
+
+// TokenWithAttention constructor implementations
+TokenWithAttention::TokenWithAttention(const std::string& text)
+    : token_text(text), has_attention(false) {}
+
+TokenWithAttention::TokenWithAttention(const std::string& text, const AttentionCapture& attention_src)
+    : token_text(text) {
+    if (attention_src.enabled && attention_src.buffer_used > 0) {
+        // Copy attention data from static buffer BEFORE next token overwrites it
+        attention_data.assign(
+            attention_src.buffer,
+            attention_src.buffer + attention_src.buffer_used
+        );
+        n_layers = attention_src.n_layers_captured;
+        n_heads = attention_src.n_heads;
+        seq_len = attention_src.seq_len;
+        has_attention = true;
+    } else {
+        has_attention = false;
+    }
+}
 
 //const
 const int extra_context_handle_fragmentation = 128;
