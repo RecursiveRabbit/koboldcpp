@@ -1543,6 +1543,7 @@ def generate(genparams, stream_flag=False):
     bypass_eos_token = genparams.get('bypass_eos', False)
     tool_call_fix = genparams.get('using_openai_tools', False)
     custom_token_bans = genparams.get('custom_token_bans', '')
+    output_attentions = genparams.get('output_attentions', False)
 
     for tok in custom_token_bans.split(','):
         tok = tok.strip()  # Remove leading/trailing whitespace
@@ -1687,6 +1688,8 @@ def generate(genparams, stream_flag=False):
     for n, tok in enumerate(banned_tokens):
         inputs.banned_tokens[n] = tok.encode("UTF-8")
 
+    inputs.output_attentions = output_attentions
+
     currentusergenkey = genkey
     totalgens += 1
     #early exit if aborted
@@ -1705,7 +1708,30 @@ def generate(genparams, stream_flag=False):
                 sindex = outstr.find(trim_str)
                 if sindex != -1 and trim_str!="":
                     outstr = outstr[:sindex]
-        return {"text":outstr,"status":ret.status,"stopreason":ret.stopreason,"prompt_tokens":ret.prompt_tokens, "completion_tokens": ret.completion_tokens}
+
+        result = {"text":outstr,"status":ret.status,"stopreason":ret.stopreason,"prompt_tokens":ret.prompt_tokens, "completion_tokens": ret.completion_tokens}
+
+        # Add attention data if requested and available
+        if output_attentions and ret.attention_n_layers > 0 and ret.attention_weights:
+            import numpy as np
+            # Convert attention weights to numpy array
+            total_elements = ret.attention_n_layers * ret.attention_n_heads * ret.attention_seq_len
+            attention_array = np.ctypeslib.as_array(ret.attention_weights, shape=(total_elements,))
+            attention_array = attention_array.reshape((ret.attention_n_layers, ret.attention_n_heads, ret.attention_seq_len))
+
+            # Encode as base64
+            attention_bytes = attention_array.tobytes()
+            attention_base64 = base64.b64encode(attention_bytes).decode('ascii')
+
+            result["attention"] = {
+                "format": "per_layer",
+                "shape": [ret.attention_n_layers, ret.attention_n_heads, ret.attention_seq_len],
+                "encoding": "base64",
+                "dtype": "float32",
+                "data": attention_base64
+            }
+
+        return result
 
 sd_convdirect_choices = ['off', 'vaeonly', 'full']
 
@@ -3053,6 +3079,8 @@ class KcppServerRequestHandler(http.server.SimpleHTTPRequestHandler):
         async_sleep_short = 0.02
         await asyncio.sleep(0.35) #anti race condition, prevent check from overtaking generate
 
+        output_attentions = genparams.get('output_attentions', False)
+
         try:
             tokenReserve = "" #keeps fully formed tokens that we cannot send out yet
             while True:
@@ -3068,6 +3096,7 @@ class KcppServerRequestHandler(http.server.SimpleHTTPRequestHandler):
                     if token is None: # Token isnt ready yet, received nullpointer
                         break
 
+                    token_idx = current_token
                     current_token += 1
                     newbyte = ctypes.string_at(token)
                     incomplete_token_buffer += bytearray(newbyte)
@@ -3076,7 +3105,62 @@ class KcppServerRequestHandler(http.server.SimpleHTTPRequestHandler):
                     badFragment = (tokenSeg==" " and len(incomplete_token_buffer)>1) or incseq #partial incomplete unicode
                     if tokenSeg!="" and not badFragment:
                         incomplete_token_buffer.clear()
-                        tokenStr += tokenSeg
+
+                        # If attention extraction is enabled, send individual token events
+                        if output_attentions:
+                            import numpy as np
+                            token_event = {
+                                "type": "token",
+                                "token": {
+                                    "token_id": None,  # TODO: Add token ID retrieval
+                                    "text": tokenSeg
+                                }
+                            }
+
+                            # Retrieve attention for this token (push model - already captured)
+                            attn = handle.get_token_attention(token_idx)
+                            if attn.valid:
+                                total_elements = attn.n_layers * attn.n_heads * attn.seq_len
+                                attention_array = np.ctypeslib.as_array(attn.data, shape=(total_elements,))
+                                attention_array = attention_array.reshape((attn.n_layers, attn.n_heads, attn.seq_len))
+
+                                attention_bytes = attention_array.tobytes()
+                                attention_base64 = base64.b64encode(attention_bytes).decode('ascii')
+
+                                token_event["attention"] = {
+                                    "format": "per_layer",
+                                    "shape": [attn.n_layers, attn.n_heads, attn.seq_len],
+                                    "context_length": attn.seq_len,
+                                    "encoding": "base64",
+                                    "dtype": "float32",
+                                    "data": attention_base64
+                                }
+                            else:
+                                token_event["attention"] = None
+
+                            # Send token event immediately
+                            event_str = json.dumps(token_event)
+                            await self.send_kai_sse_event(event_str)
+                        else:
+                            # Normal mode: accumulate tokens
+                            tokenStr += tokenSeg
+
+                # Send done event for attention mode
+                if output_attentions and streamDone:
+                    done_event = {
+                        "type": "done",
+                        "finish_reason": currfinishreason,
+                        "total_tokens": handle.get_stream_count()
+                    }
+                    event_str = json.dumps(done_event)
+                    await self.send_kai_sse_event(event_str)
+
+                # Skip normal accumulation logic when in attention mode
+                if output_attentions:
+                    if streamDone:
+                        break
+                    await asyncio.sleep(async_sleep_short)
+                    continue
 
                 if tokenStr!="" or streamDone:
                     sseq = genparams.get('stop_sequence', [])
@@ -4215,7 +4299,7 @@ Change Mode<br>
 
                 if api_format > 0: #text gen
                     # Check if streaming chat completions, if so, set stream mode to true
-                    if (api_format == 4 or api_format == 3) and "stream" in genparams and genparams["stream"]:
+                    if (api_format == 4 or api_format == 3 or api_format == 2) and "stream" in genparams and genparams["stream"]:
                         sse_stream_flag = True
 
                     gendat = asyncio.run(self.handle_request(genparams, api_format, sse_stream_flag))

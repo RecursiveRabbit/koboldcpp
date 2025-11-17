@@ -52,6 +52,8 @@
 
 void AttentionCapture::init(int max_heads, int max_ctx, int max_layers) {
     buffer_capacity = (size_t)max_heads * max_ctx * max_layers;
+    fprintf(stderr, "DEBUG init: max_heads=%d, max_ctx=%d, max_layers=%d, buffer_capacity=%zu\n",
+            max_heads, max_ctx, max_layers, buffer_capacity);
     buffer = (float*)malloc(buffer_capacity * sizeof(float));
     if (buffer == nullptr) {
         fprintf(stderr, "ERROR: Failed to allocate attention buffer (%zu MB)\n",
@@ -59,6 +61,7 @@ void AttentionCapture::init(int max_heads, int max_ctx, int max_layers) {
         buffer_capacity = 0;
     }
     reset();
+    fprintf(stderr, "DEBUG init DONE: buffer=%p\n", (void*)buffer);
 }
 
 void AttentionCapture::reset() {
@@ -71,6 +74,8 @@ void AttentionCapture::reset() {
 
 void AttentionCapture::append_layer(const float* data, int heads, int len) {
     size_t count = (size_t)heads * len;
+    fprintf(stderr, "DEBUG append_layer: heads=%d, len=%d, count=%zu, buffer_used=%zu, capacity=%zu\n",
+            heads, len, count, buffer_used, buffer_capacity);
     if (buffer_used + count > buffer_capacity) {
         fprintf(stderr, "WARNING: Attention buffer overflow (used %zu, capacity %zu)\n",
                 buffer_used + count, buffer_capacity);
@@ -81,6 +86,8 @@ void AttentionCapture::append_layer(const float* data, int heads, int len) {
     n_layers_captured++;
     if (n_heads == 0) n_heads = heads;  // Set once
     if (seq_len == 0) seq_len = len;    // Set once
+    fprintf(stderr, "DEBUG append_layer DONE: buffer_used=%zu, n_layers_captured=%d\n",
+            buffer_used, n_layers_captured);
 }
 
 void AttentionCapture::free_buffer() {
@@ -108,8 +115,12 @@ TokenWithAttention::TokenWithAttention(const std::string& text, const AttentionC
         n_heads = attention_src.n_heads;
         seq_len = attention_src.seq_len;
         has_attention = true;
+        fprintf(stderr, "DEBUG: Token '%s' paired with attention [%d, %d, %d]\n",
+                text.substr(0, 20).c_str(), n_layers, n_heads, seq_len);
     } else {
         has_attention = false;
+        fprintf(stderr, "DEBUG: Token '%s' NO attention (enabled=%d, buffer_used=%zu)\n",
+                text.substr(0, 20).c_str(), attention_src.enabled, attention_src.buffer_used);
     }
 }
 
@@ -234,53 +245,75 @@ void attention_capture_callback(const llama_ubatch & ubatch,
         return;
     }
 
-    // Tensor shape: [seq_len_k, n_heads, seq_len_q, n_stream]
-    // During generation: [seq_len_k, n_heads, 1, 1]
-    int64_t seq_len_k = cur->ne[0];  // KV cache length
-    int64_t n_heads = cur->ne[1];
-    int64_t seq_len_q = cur->ne[2];  // Query length (typically 1)
-    int64_t n_stream = cur->ne[3];   // Batch size (typically 1)
+    fprintf(stderr, "DEBUG: Attention callback fired for layer %d\n", il);
+
+    // Tensor shape: [seq_len_k, seq_len_q, n_heads, batch]
+    // During generation: [seq_len_k, 1, n_heads, 1]
+    int64_t seq_len_k = cur->ne[0];  // KV cache length (context)
+    int64_t seq_len_q = cur->ne[1];  // Query length (typically 1 during generation)
+    int64_t n_heads = cur->ne[2];    // Number of attention heads
+    int64_t batch = cur->ne[3];      // Batch size (typically 1)
+
+    fprintf(stderr, "DEBUG: Tensor shape: [seq_len_k=%lld, seq_len_q=%lld, n_heads=%lld, batch=%lld]\n",
+            (long long)seq_len_k, (long long)seq_len_q, (long long)n_heads, (long long)batch);
 
     // Only handle single-token generation for now
-    if (seq_len_q != 1 || n_stream != 1) {
+    if (seq_len_q != 1 || batch != 1) {
+        fprintf(stderr, "DEBUG: SKIP - seq_len_q=%lld (want 1), batch=%lld (want 1)\n",
+                (long long)seq_len_q, (long long)batch);
         return;
     }
+
+    fprintf(stderr, "DEBUG: PROCEEDING to extract attention\n");
 
     // Calculate tensor size
-    size_t tensor_elements = seq_len_k * n_heads * seq_len_q * n_stream;
+    size_t tensor_elements = seq_len_k * seq_len_q * n_heads * batch;
     size_t tensor_bytes = tensor_elements * sizeof(float);
 
-    // Allocate temporary buffer for GPU->CPU copy
-    float* temp = (float*)malloc(tensor_bytes);
-    if (temp == nullptr) {
-        fprintf(stderr, "ERROR: Failed to allocate temp buffer for attention copy\n");
+    // Check if tensor has a buffer assigned (might not during graph construction)
+    if (cur->buffer == nullptr) {
+        fprintf(stderr, "DEBUG: Tensor buffer not assigned yet, skipping (graph construction phase)\n");
         return;
     }
 
-    // Copy attention tensor from GPU/backend to CPU
-    ggml_backend_tensor_get(cur, temp, 0, tensor_bytes);
+    // Allocate CPU buffer for the data
+    float* tensor_data = (float*)malloc(tensor_bytes);
+    if (tensor_data == nullptr) {
+        fprintf(stderr, "ERROR: Failed to allocate CPU buffer for attention\n");
+        return;
+    }
 
-    // Data layout is [seq_len_k, n_heads, 1, 1]
+    // Copy tensor from backend (GPU/CPU) to our CPU buffer
+    fprintf(stderr, "DEBUG: Copying %zu bytes from backend tensor\n", tensor_bytes);
+    ggml_backend_tensor_get(cur, tensor_data, 0, tensor_bytes);
+
+    // Data layout in memory: [seq_len_k, seq_len_q, n_heads, batch]
+    // With seq_len_q=1, batch=1: effectively [seq_len_k, n_heads]
     // We want [n_heads, seq_len_k] for easier processing
-    // Reshape: transpose from [seq_len_k, n_heads] to [n_heads, seq_len_k]
-    float* transposed = (float*)malloc(tensor_elements * sizeof(float));
+    // Tensor indexing: tensor_data[k + q*seq_len_k + h*seq_len_k*seq_len_q + b*seq_len_k*seq_len_q*n_heads]
+    // With q=0, b=0: tensor_data[k + h*seq_len_k]
+
+    float* transposed = (float*)malloc(seq_len_k * n_heads * sizeof(float));
     if (transposed == nullptr) {
-        free(temp);
         fprintf(stderr, "ERROR: Failed to allocate transposed buffer\n");
         return;
     }
 
     for (int h = 0; h < n_heads; h++) {
-        for (int s = 0; s < seq_len_k; s++) {
-            transposed[h * seq_len_k + s] = temp[s * n_heads + h];
+        for (int k = 0; k < seq_len_k; k++) {
+            // Input: [k, 0, h, 0] -> tensor_data[k + h*seq_len_k]
+            // Output: [h, k] -> transposed[h * seq_len_k + k]
+            transposed[h * seq_len_k + k] = tensor_data[k + h * seq_len_k];
         }
     }
+
+    fprintf(stderr, "DEBUG: Transposed attention data\n");
 
     // Append to global buffer
     g_attention.append_layer(transposed, n_heads, seq_len_k);
 
     free(transposed);
-    free(temp);
+    free(tensor_data);
 }
 static std::map<int,std::vector<int>> antislop_banned_token_ids; //first is the npast position, second is the array of banned ids at that index
 
@@ -3370,6 +3403,9 @@ generation_outputs gpttype_generate(const generation_inputs inputs)
     // Reset and enable attention capture if requested
     g_attention.reset();
     g_attention.enabled = inputs.output_attentions;
+    if (g_attention.enabled) {
+        fprintf(stderr, "DEBUG: Attention capture ENABLED for this generation\n");
+    }
 
     double time0 = 0, time1 = 0, time2 = 0;
     timer_start();

@@ -368,17 +368,91 @@ Generation N+1:
 
 ## Status
 
-**Last Updated**: 2025-11-16 (Session 2)
+**Last Updated**: 2025-11-16 (Session 3)
 
-**Implementation Status**: ✅ COMPLETE - Compiled and bindings verified
-**Architecture**: Push model with atomic token+attention pairing
+**Implementation Status**: ⚠️ BLOCKED - Tensor access timing issue
+**Architecture**: Push model with atomic token+attention pairing (complete)
 **Compilation**: ✅ SUCCESS (CUDA + CPU builds)
 **Binding Tests**: ✅ PASS (get_token_attention callable)
-**Model Testing**: ⏳ TODO (have Qwen2.5-VL-7B-Instruct-Q8_0.gguf ready)
+**Model Testing**: ⚠️ BLOCKED - Cannot access tensor data during callback
 
 ---
 
 ## Session Log
+
+### Session 3 (2025-11-16): Tensor Access Timing Issue - BLOCKED
+
+**Problem**: Callback fires during graph construction, not execution. Attention tensors don't have data yet.
+
+**What We Built**:
+1. ✅ Fixed tensor dimension mapping: `[seq_len_k, seq_len_q, n_heads, batch]` (not `[seq_len_k, n_heads, seq_len_q, batch]`)
+2. ✅ Correctly filters for single-token generation (`seq_len_q=1, batch=1`)
+3. ✅ Implements Python streaming API (SSE endpoint modified)
+4. ✅ Sends individual token events with attention payload (base64-encoded)
+5. ✅ Test script validates streaming token-by-token output
+
+**What Works**:
+- Callback successfully intercepts `kq_soft_max` tensors
+- Dimension checks pass correctly (skips prompt processing with `seq_len_q=15`, proceeds for generation with `seq_len_q=1`)
+- Shape detection is accurate: `[256, 1, 28, 1]` for Qwen 7B single-token generation
+- Python streaming endpoint correctly modified to send per-token JSON events
+
+**The Blocking Issue**:
+```
+DEBUG: PROCEEDING to extract attention
+DEBUG: Tensor buffer not assigned yet, skipping (graph construction phase)
+```
+
+The callback `attention_capture_callback()` is invoked via `llm_graph_context::cb()` in `src/llama-graph.cpp:608`. This happens **during graph construction** (when building the computational graph), NOT during graph execution (when running the computation).
+
+At callback time:
+- ❌ `cur->buffer == nullptr` - Tensor buffer not allocated yet
+- ❌ `ggml_get_data(cur) == nullptr` - Data pointer is null
+- ❌ `ggml_backend_tensor_get()` fails with assertion: `buf != NULL && "tensor buffer not set"`
+
+**Why This Happens**:
+1. `llama_decode()` builds computational graph first (callbacks fire here)
+2. Then schedules and executes graph on backend (GPU/CPU)
+3. By the time graph executes, callback context is gone
+
+**Attempted Solutions** (all failed):
+1. ❌ Direct pointer access (`ggml_get_data`) - returns null
+2. ❌ Backend copy (`ggml_backend_tensor_get`) - buffer not set
+3. ❌ Buffer existence check (`cur->buffer != nullptr`) - always null during callback
+
+**What Needs to Be Done**:
+Access attention tensors **AFTER** `llama_decode()` completes, not during graph construction. Options:
+
+**Option A: Post-decode tensor traversal**
+- After `llama_decode()` returns (line 4165 in gpttype_adapter.cpp)
+- Traverse the executed computational graph
+- Find all `kq_soft_max` tensors by name
+- Copy from GPU to CPU using `ggml_backend_tensor_get()` (buffer should exist now)
+- Store in `g_attention` buffer
+
+**Option B: Modify llama.cpp to expose attention**
+- Add parameter to `llama_decode()` to return attention tensors
+- Have llama.cpp collect and return them after graph execution
+- This would require upstream changes to llama.cpp
+
+**Option C: Deferred callback approach**
+- Store tensor pointers during callback (without copying data)
+- After `llama_decode()` completes, copy data from stored pointers
+- Risk: Pointers might be invalid after graph execution
+
+**Recommended**: Option A - traverse graph after decode completes.
+
+**Key Files**:
+- `gpttype_adapter.cpp:228-317` - Current callback implementation
+- `src/llama-graph.cpp:603-609` - Where callback is invoked
+- `gpttype_adapter.cpp:4165` - Main decode call site (add post-decode extraction here)
+
+**Next Steps**:
+1. Research how to access computational graph tensors after execution in llama.cpp
+2. Find API to enumerate graph nodes and access tensor data post-execution
+3. Implement post-decode extraction instead of callback approach
+
+---
 
 ### Session 2 (2025-11-16): Compilation & Binding Verification
 
