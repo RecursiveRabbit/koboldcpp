@@ -1,9 +1,30 @@
-# KoboldCPP Dream API Specification
-## Attention Extraction for Halo Weave Integration
+# KoboldCPP Attention Extraction API Specification
+## REST and WebSocket APIs for Halo Weave Integration
 
-**Version**: 1.0
-**Date**: 2025-11-16
-**Purpose**: Define the ideal KoboldCPP API for extracting attention patterns during text generation
+**Version**: 2.0
+**Date**: 2025-11-17
+**Purpose**: Define REST and WebSocket APIs for exposing transformer attention patterns during text generation
+
+---
+
+## Implementation Status
+
+### ✅ Phase 1: C++ Extraction Layer (COMPLETE)
+- Deferred attention tensor extraction from llama.cpp
+- GPU→CPU copy after graph execution
+- Shape: `[n_layers, n_heads, seq_len]` per token
+- Atomic token+attention pairing
+- Verified working with Qwen 7B (28L, 28H)
+
+**Files**: `gpttype_adapter.cpp`, `expose.h`
+
+### 🔨 Phase 2: REST/WebSocket API (THIS SPEC - TO BE BUILT)
+- Expose attention via koboldcpp.py HTTP/WebSocket endpoints
+- Base64 encoding for JSON transmission
+- Streaming token-by-token delivery
+- Model info endpoint
+
+**Target Files**: `koboldcpp.py`, API handlers
 
 ---
 
@@ -12,6 +33,8 @@
 This specification defines REST and WebSocket APIs that expose transformer attention patterns during text generation. The goal is to enable **brightness-based context pruning** in Halo Weave by providing real-time attention scores for every token in the conversation.
 
 **Critical requirement**: The API must return **raw per-layer, per-head attention tensors**, not pre-aggregated values, to support flexible aggregation strategies (mean, max, weighted layers, etc.) and advanced features like distance weighting.
+
+**Foundation**: Built on top of the C++ extraction layer implemented in Session 4 (2025-11-17), which successfully extracts attention tensors from quantized models.
 
 ---
 
@@ -1007,84 +1030,134 @@ Halo Weave:
 
 ## Appendix B: Attention Extraction Implementation Notes
 
-### For Future Claude Implementing This in KoboldCPP
+### Phase 1: C++ Extraction (IMPLEMENTED ✅)
+
+**Deferred Extraction Approach**:
+
+The key insight: Callbacks fire during graph *construction*, not execution. Tensors don't have data yet.
+
+**Solution** (implemented in `gpttype_adapter.cpp`):
+1. **Callback stores pointers**: `attention_capture_callback()` stores tensor pointers in `g_pending_attentions`
+2. **Post-decode extraction**: `extract_pending_attention_data()` runs after `llama_decode()` completes
+3. **GPU→CPU copy**: Use `ggml_backend_tensor_get()` - buffers exist now
+4. **Transpose**: `[seq_len_k, n_heads]` → `[n_heads, seq_len_k]`
+5. **Store**: Append to `g_attention.buffer` for API access
+
+**Why it works**:
+- Graph cached in `llama_context::gf_res_prev` for reuse
+- Tensor pointers remain valid until next decode
+- Extract within safe window (after compute, before next decode)
+
+**Key code locations**:
+- `gpttype_adapter.cpp:246-268` - Callback stores pointers
+- `gpttype_adapter.cpp:271-343` - Post-decode extraction
+- `gpttype_adapter.cpp:4216-4220` - Hook after `llama_decode()`
+
+### Phase 2: API Layer (TO BE IMPLEMENTED 🔨)
 
 **Key files to modify**:
-1. `llama.cpp` or Python inference wrapper - Extract attention during forward pass
-2. API handler - Add WebSocket endpoint, encode attention data
-3. Model config - Expose num_layers, num_heads to API
+1. `koboldcpp.py` - Add REST/WebSocket endpoints
+2. API handlers - Encode attention data as base64, send via JSON
+3. Model info - Expose num_layers, num_heads to API
 
-**PyTorch attention extraction** (reference):
+**Python API implementation using C++ extraction layer**:
 ```python
-# Load model with attention output enabled
-model = AutoModelForCausalLM.from_pretrained(
-    model_name,
-    torch_dtype=torch.bfloat16,
-    device_map="cuda:0"
-)
+import ctypes
+import numpy as np
+import base64
+import json
 
-# Forward pass with attention
-outputs = model(
-    input_ids=input_ids,
-    attention_mask=attention_mask,
-    output_attentions=True  # KEY FLAG
-)
+# In koboldcpp.py streaming handler
 
-# outputs.attentions is a tuple of tensors, one per layer
-# Each tensor: (batch_size, num_heads, seq_len, seq_len)
-attention_tensors = outputs.attentions
+# After each token is generated...
+token_idx = handle.get_stream_count() - 1  # Latest token
 
-# Extract attention FROM new token (last position) TO all tokens
-attention_from_new_token = torch.stack([
-    attn[0, :, -1, :]  # [batch=0, all_heads, from_last_token, to_all_tokens]
-    for attn in attention_tensors
-])
-# Shape: (num_layers, num_heads, seq_len)
+# Get attention from C++ layer
+attention_output = handle.get_token_attention(token_idx)
 
-# Convert to numpy for JSON serialization
-attention_np = attention_from_new_token.cpu().numpy().astype(np.float32)
+if attention_output.valid:
+    # Convert C pointer to numpy array
+    attention_np = np.ctypeslib.as_array(
+        attention_output.data,
+        shape=(attention_output.n_layers, attention_output.n_heads, attention_output.seq_len)
+    )
 
-# Encode as base64
-attention_bytes = attention_np.tobytes()
-attention_base64 = base64.b64encode(attention_bytes).decode('ascii')
+    # Shape: (num_layers, num_heads, seq_len)
+    # Already in correct format! C++ layer does the extraction and transpose
 
-# Send via WebSocket
-await websocket.send(json.dumps({
-    "type": "token",
-    "token": {"token_id": next_token.item(), "text": tokenizer.decode(next_token)},
-    "attention": {
-        "format": "per_layer",
-        "shape": list(attention_np.shape),
-        "encoding": "base64",
-        "dtype": "float32",
-        "data": attention_base64
-    }
-}))
+    # Encode as base64 for JSON
+    attention_bytes = attention_np.tobytes()
+    attention_base64 = base64.b64encode(attention_bytes).decode('ascii')
+
+    # Send via WebSocket
+    await websocket.send(json.dumps({
+        "type": "token",
+        "token": {
+            "token_id": token_id,
+            "text": token_text
+        },
+        "attention": {
+            "format": "per_layer",
+            "shape": [attention_np.shape[0], attention_np.shape[1], attention_np.shape[2]],
+            "encoding": "base64",
+            "dtype": "float32",
+            "data": attention_base64
+        }
+    }))
 ```
 
-**llama.cpp attention extraction** (pseudocode):
+**Key differences from PyTorch approach**:
+- No `model.forward()` call - C++ layer handles this
+- No tensor extraction from `outputs.attentions` - already done
+- No transpose needed - C++ layer returns `[n_layers, n_heads, seq_len]`
+- Just read buffer, encode, send
+
+**Actual implementation in gpttype_adapter.cpp** (deferred extraction):
 ```cpp
-// During forward pass, store attention weights
-struct llama_context {
-    // ...
-    float * attention_weights;  // Allocated: n_layers * n_heads * n_ctx
-    bool output_attentions;
+// Global storage
+static AttentionCapture g_attention;  // Pre-allocated 128MB buffer
+static std::vector<PendingAttentionTensor> g_pending_attentions;
+
+struct PendingAttentionTensor {
+    ggml_tensor * tensor;
+    int layer_idx;
 };
 
-// After softmax(Q @ K.T / sqrt(d_k))
-if (ctx->output_attentions) {
-    // Copy attention weights from new token to buffer
-    memcpy(
-        ctx->attention_weights + layer_idx * n_heads * n_ctx,
-        attention_probs,
-        n_heads * n_ctx * sizeof(float)
-    );
+// Phase 1: Callback during graph construction - just store pointers
+void attention_capture_callback(const llama_ubatch & ubatch,
+                                ggml_tensor * cur,
+                                const char * name,
+                                int il) {
+    if (!g_attention.enabled || strcmp(name, "kq_soft_max") != 0) return;
+    if (seq_len_q != 1 || batch != 1) return;  // Single-token generation only
+
+    g_pending_attentions.push_back({cur, il});  // Store pointer, don't copy
 }
 
-// In API handler, read attention_weights buffer and encode for transmission
+// Phase 2: After llama_decode() - NOW extract data
+void extract_pending_attention_data() {
+    g_attention.reset();  // Clear for this token (preserves 'enabled' flag)
+
+    for (const auto & pending : g_pending_attentions) {
+        // NOW buffers exist - safe to copy
+        ggml_backend_tensor_get(pending.tensor, temp_buffer, 0, tensor_bytes);
+
+        // Transpose [seq_len_k, n_heads] → [n_heads, seq_len_k]
+        // ... transpose code ...
+
+        g_attention.append_layer(transposed, n_heads, seq_len_k);
+    }
+
+    g_pending_attentions.clear();
+}
+
+// Hook in main generation loop (after decode)
+if (evalres && embd.size() == 1 && startedsampling) {
+    extract_pending_attention_data();
+}
 ```
 
-**Performance tip**: Attention extraction adds ~5-10% overhead to generation (copying from GPU to CPU). Only enable when client requests it.
+**Performance**: Attention extraction adds ~5-10% overhead (GPU→CPU copy). Only enable when `output_attentions=true`.
 
 ---
 
@@ -1094,4 +1167,24 @@ This API specification prioritizes **flexibility, correctness, and debuggability
 
 The stateless design keeps KoboldCPP simple (no conversation state management) while giving Halo Weave full control over the token dictionary and attention accumulation logic.
 
-**Next step**: Implement this API in KoboldCPP and verify attention tensor shapes match expectations using the validation checklist in the Testing section.
+### Current Status
+
+**Phase 1 (COMPLETE ✅)**: C++ extraction layer is production-ready
+- Deferred extraction solves tensor access timing issue
+- GPU→CPU copy working reliably
+- Correct shape: `[n_layers, n_heads, seq_len]` per token
+- Verified with Qwen 7B Q8_0 model
+
+**Phase 2 (NEXT STEP 🔨)**: Build REST/WebSocket API layer
+1. Add endpoints to `koboldcpp.py` (`/api/v1/model/info`, `/api/v1/generate`, streaming)
+2. Read attention via `get_token_attention(token_idx)` C API
+3. Encode as base64 and send in JSON responses
+4. Test streaming with Halo Weave client
+
+**Phase 3 (FUTURE)**: Optimization and advanced features
+- Sparse attention (top-K values only)
+- Compression (gzip, delta encoding)
+- Multi-batch support
+- Performance tuning
+
+The hard part is done - we can extract attention from quantized models. Now we just need to wrap it in a user-friendly API.
