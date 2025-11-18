@@ -1711,13 +1711,18 @@ def generate(genparams, stream_flag=False):
 
         result = {"text":outstr,"status":ret.status,"stopreason":ret.stopreason,"prompt_tokens":ret.prompt_tokens, "completion_tokens": ret.completion_tokens}
 
-        # Add attention data if requested and available
-        if output_attentions and ret.attention_n_layers > 0 and ret.attention_weights:
+        # Add attention data if available (extraction is always-on)
+        if ret.attention_n_layers > 0 and ret.attention_weights:
             import numpy as np
             # Convert attention weights to numpy array
             total_elements = ret.attention_n_layers * ret.attention_n_heads * ret.attention_seq_len
             attention_array = np.ctypeslib.as_array(ret.attention_weights, shape=(total_elements,))
             attention_array = attention_array.reshape((ret.attention_n_layers, ret.attention_n_heads, ret.attention_seq_len))
+
+            # DEBUG: Dump raw buffer to file for inspection
+            with open("raw_attention.bin", "wb") as f:
+                f.write(attention_array.tobytes())
+            print(f"\n✅ Dumped {total_elements * 4} bytes of raw attention to raw_attention.bin")
 
             # Encode as base64
             attention_bytes = attention_array.tobytes()
@@ -3044,6 +3049,11 @@ class KcppServerRequestHandler(http.server.SimpleHTTPRequestHandler):
             res = {"model": friendlymodelname,"created_at": str(datetime.now(timezone.utc).isoformat()),"message":{"role":"assistant","content":recvtxt},"done": True,"done_reason":currfinishreason,"total_duration": 1,"load_duration": 1,"prompt_eval_count": prompttokens,"prompt_eval_duration": 1,"eval_count": comptokens,"eval_duration": 1}
         else: #kcpp format
             res = {"results": [{"text": recvtxt, "tool_calls": tool_calls, "finish_reason": currfinishreason, "logprobs":logprobsdict, "prompt_tokens": prompttokens, "completion_tokens": comptokens}]}
+
+        # Add attention data from genout if present (unconditional extraction)
+        if "attention" in genout:
+            if api_format == 2 or api_format == 0:  # kcpp format
+                res["results"][0]["attention"] = genout["attention"]
 
         try:
             return res

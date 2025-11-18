@@ -69,7 +69,6 @@ void AttentionCapture::reset() {
     n_layers_captured = 0;
     n_heads = 0;
     seq_len = 0;
-    // NOTE: Don't clear 'enabled' - it's set per-generation, not per-token
 }
 
 void AttentionCapture::append_layer(const float* data, int heads, int len) {
@@ -105,7 +104,7 @@ TokenWithAttention::TokenWithAttention(const std::string& text)
 
 TokenWithAttention::TokenWithAttention(const std::string& text, const AttentionCapture& attention_src)
     : token_text(text) {
-    if (attention_src.enabled && attention_src.buffer_used > 0) {
+    if (attention_src.buffer_used > 0) {
         // Copy attention data from static buffer BEFORE next token overwrites it
         attention_data.assign(
             attention_src.buffer,
@@ -119,8 +118,8 @@ TokenWithAttention::TokenWithAttention(const std::string& text, const AttentionC
                 text.substr(0, 20).c_str(), n_layers, n_heads, seq_len);
     } else {
         has_attention = false;
-        fprintf(stderr, "DEBUG: Token '%s' NO attention (enabled=%d, buffer_used=%zu)\n",
-                text.substr(0, 20).c_str(), attention_src.enabled, attention_src.buffer_used);
+        fprintf(stderr, "DEBUG: Token '%s' NO attention (buffer_used=%zu)\n",
+                text.substr(0, 20).c_str(), attention_src.buffer_used);
     }
 }
 
@@ -245,12 +244,13 @@ static std::vector<PendingAttentionTensor> g_pending_attentions;
 
 // Callback to capture attention tensor pointers during graph construction
 // NOTE: Tensors don't have data yet at this point - we just store pointers
+// UNCONDITIONAL - Always capture when kq_soft_max is seen
 void attention_capture_callback(const llama_ubatch & ubatch,
                                 ggml_tensor * cur,
                                 const char * name,
                                 int il) {
-    // Only capture if enabled and this is the softmax attention tensor
-    if (!g_attention.enabled || strcmp(name, "kq_soft_max") != 0) {
+    // Only capture softmax attention tensors (no enabled check)
+    if (strcmp(name, "kq_soft_max") != 0) {
         return;
     }
 
@@ -269,10 +269,11 @@ void attention_capture_callback(const llama_ubatch & ubatch,
 }
 
 // Extract attention data from stored tensor pointers after graph execution
-// Call this AFTER llama_decode() returns, when tensor buffers are populated
+// Call this AFTER graph_compute() returns, when tensor buffers are populated
+// UNCONDITIONAL - Always extract if there are pending tensors
 void extract_pending_attention_data() {
-    if (!g_attention.enabled || g_pending_attentions.empty()) {
-        return;
+    if (g_pending_attentions.empty()) {
+        return;  // Nothing to extract
     }
 
     // Reset buffer state for this token (don't accumulate across tokens)
@@ -3427,12 +3428,8 @@ generation_outputs gpttype_generate(const generation_inputs inputs)
     top_picks_history.clear();
     early_abort = false;
 
-    // Reset and enable attention capture if requested
+    // Reset attention capture buffer (extraction is always-on)
     g_attention.reset();
-    g_attention.enabled = inputs.output_attentions;
-    if (g_attention.enabled) {
-        fprintf(stderr, "DEBUG: Attention capture ENABLED for this generation\n");
-    }
 
     double time0 = 0, time1 = 0, time2 = 0;
     timer_start();
@@ -4214,11 +4211,8 @@ generation_outputs gpttype_generate(const generation_inputs inputs)
                         evalres = (decode_status==0);
                     }
 
-                    // Extract attention data after decode completes (if enabled)
-                    // Only extract during single-token generation (embd.size()==1)
-                    if (evalres && embd.size() == 1 && startedsampling) {
-                        extract_pending_attention_data();
-                    }
+                    // NOTE: Attention extraction now happens automatically in process_ubatch()
+                    // No need for conditional hook here - it's unconditional at the core
 
                     if(draft_ctx)
                     {
@@ -4855,8 +4849,8 @@ generation_outputs gpttype_generate(const generation_inputs inputs)
     concat_output_mtx.unlock();
     output.text = concat_output_reader_copy_res.c_str();
 
-    // Copy attention weights to output if capture was enabled
-    if (g_attention.enabled && g_attention.buffer_used > 0) {
+    // Copy attention weights to output if extraction succeeded
+    if (g_attention.buffer_used > 0) {
         output.attention_weights = g_attention.buffer;
         output.attention_n_layers = g_attention.n_layers_captured;
         output.attention_n_heads = g_attention.n_heads;

@@ -162,7 +162,7 @@ struct AttentionCapture {
     int n_layers_captured = 0;
     int n_heads = 0;
     int seq_len = 0;
-    bool enabled = false;
+    // NO ENABLED FLAG - Unconditional extraction for all tokens
 
     void init(int max_heads, int max_ctx, int max_layers);
     void reset();

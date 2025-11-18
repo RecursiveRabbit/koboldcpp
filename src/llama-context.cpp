@@ -795,6 +795,11 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         return nullptr;
     }
 
+    // UNCONDITIONAL ATTENTION EXTRACTION HOOK
+    // Called after every graph compute - cannot be bypassed
+    extern void extract_pending_attention_data();
+    extract_pending_attention_data();
+
     ret = GGML_STATUS_SUCCESS;
 
     return res;
