@@ -9,22 +9,25 @@
 
 ## Implementation Status
 
-### ✅ Phase 1: C++ Extraction Layer (COMPLETE)
-- Deferred attention tensor extraction from llama.cpp
+### ✅ Phase 1: C++ Extraction Layer (COMPLETE - Session 5)
+- Unconditional attention tensor extraction at core `process_ubatch()`
 - GPU→CPU copy after graph execution
 - Shape: `[n_layers, n_heads, seq_len]` per token
+- Raw pre-softmax logits (range: -94 to +84)
 - Atomic token+attention pairing
 - Verified working with Qwen 7B (28L, 28H)
 
-**Files**: `gpttype_adapter.cpp`, `expose.h`
+**Files**: `gpttype_adapter.cpp`, `expose.h`, `expose.cpp`, `src/llama-context.cpp`
 
-### 🔨 Phase 2: REST/WebSocket API (THIS SPEC - TO BE BUILT)
-- Expose attention via koboldcpp.py HTTP/WebSocket endpoints
+### ✅ Phase 2: REST/WebSocket API (COMPLETE - Session 6)
+- Token IDs exposed via C API `new_token_id()`
+- Streaming endpoint `/api/extra/generate/stream` with `output_attentions=True`
 - Base64 encoding for JSON transmission
-- Streaming token-by-token delivery
-- Model info endpoint
+- Complete Token Event JSON with token_id + text + attention
+- Request ID tracking
+- Tested and verified working
 
-**Target Files**: `koboldcpp.py`, API handlers
+**Files**: `koboldcpp.py`, `expose.cpp`, test scripts
 
 ---
 
@@ -34,7 +37,7 @@ This specification defines REST and WebSocket APIs that expose transformer atten
 
 **Critical requirement**: The API must return **raw per-layer, per-head attention tensors**, not pre-aggregated values, to support flexible aggregation strategies (mean, max, weighted layers, etc.) and advanced features like distance weighting.
 
-**Foundation**: Built on top of the C++ extraction layer implemented in Session 4 (2025-11-17), which successfully extracts attention tensors from quantized models.
+**Status**: ✅ **PRODUCTION READY** - Both C++ extraction layer (Session 5) and Python API layer (Session 6) are complete and tested. Ready for Halo Weave integration.
 
 ---
 
@@ -1171,17 +1174,20 @@ The stateless design keeps KoboldCPP simple (no conversation state management) w
 
 ### Current Status
 
-**Phase 1 (COMPLETE ✅)**: C++ extraction layer is production-ready
-- Deferred extraction solves tensor access timing issue
+**Phase 1 (COMPLETE ✅)**: C++ extraction layer - Session 5 (2025-11-18)
+- Unconditional extraction at core `process_ubatch()`
 - GPU→CPU copy working reliably
+- Raw pre-softmax logits (range: -94 to +84)
 - Correct shape: `[n_layers, n_heads, seq_len]` per token
 - Verified with Qwen 7B Q8_0 model
 
-**Phase 2 (NEXT STEP 🔨)**: Build REST/WebSocket API layer
-1. Add endpoints to `koboldcpp.py` (`/api/v1/model/info`, `/api/v1/generate`, streaming)
-2. Read attention via `get_token_attention(token_idx)` C API
-3. Encode as base64 and send in JSON responses
-4. Test streaming with Halo Weave client
+**Phase 2 (COMPLETE ✅)**: Python API layer - Session 6 (2025-11-18)
+- Streaming endpoint `/api/extra/generate/stream` working
+- Token IDs exposed via `new_token_id()` C API
+- Base64 encoding and JSON transmission implemented
+- Complete Token Event JSON with token_id + text + attention
+- Request ID tracking functional
+- Tested and verified with streaming generation
 
 **Phase 3 (FUTURE)**: Optimization and advanced features
 - Sparse attention (top-K values only)
@@ -1189,4 +1195,4 @@ The stateless design keeps KoboldCPP simple (no conversation state management) w
 - Multi-batch support
 - Performance tuning
 
-The hard part is done - we can extract attention from quantized models. Now we just need to wrap it in a user-friendly API.
+**Status**: ✅ PRODUCTION READY - The complete pipeline from C++ extraction to streaming JSON API is working and tested. Ready for Halo Weave integration!
