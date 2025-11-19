@@ -132,6 +132,8 @@ struct generation_inputs
     const int banned_tokens_len = 0;
     const char ** banned_tokens = nullptr;
     const bool output_attentions = false;
+    const int input_ids_len = 0;
+    const int32_t * input_ids = nullptr;
 };
 struct generation_outputs
 {

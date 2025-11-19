@@ -266,7 +266,9 @@ class generation_inputs(ctypes.Structure):
                 ("logit_biases", ctypes.POINTER(logit_bias)),
                 ("banned_tokens_len", ctypes.c_int),
                 ("banned_tokens", ctypes.POINTER(ctypes.c_char_p)),
-                ("output_attentions", ctypes.c_bool)]
+                ("output_attentions", ctypes.c_bool),
+                ("input_ids_len", ctypes.c_int),
+                ("input_ids", ctypes.POINTER(ctypes.c_int32))]
 
 class generation_outputs(ctypes.Structure):
     _fields_ = [("status", ctypes.c_int),
@@ -1508,6 +1510,7 @@ def generate(genparams, stream_flag=False):
     prompt = genparams.get('prompt', "")
     memory = genparams.get('memory', "")
     negative_prompt = genparams.get('negative_prompt', "")
+    input_ids = genparams.get('input_ids', None)
     guidance_scale = tryparsefloat(genparams.get('guidance_scale', 1.0),1.0)
     images = genparams.get('images', [])
     audio = genparams.get('audio', [])
@@ -1570,7 +1573,17 @@ def generate(genparams, stream_flag=False):
             logit_biases[tok] = bias_min_value
 
     inputs = generation_inputs()
-    inputs.prompt = prompt.encode("UTF-8")
+    # Handle input_ids if provided (bypasses tokenization)
+    if input_ids is not None and len(input_ids) > 0:
+        # Convert Python list to ctypes array
+        input_ids_array = (ctypes.c_int32 * len(input_ids))(*input_ids)
+        inputs.input_ids = input_ids_array
+        inputs.input_ids_len = len(input_ids)
+        inputs.prompt = "".encode("UTF-8")  # Empty prompt when using input_ids
+    else:
+        inputs.prompt = prompt.encode("UTF-8")
+        inputs.input_ids_len = 0
+        inputs.input_ids = None
     inputs.memory = memory.encode("UTF-8")
     inputs.negative_prompt = negative_prompt.encode("UTF-8")
     inputs.guidance_scale = guidance_scale

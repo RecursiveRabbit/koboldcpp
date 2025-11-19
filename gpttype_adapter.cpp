@@ -3864,7 +3864,21 @@ generation_outputs gpttype_generate(const generation_inputs inputs)
 
     int32_t nctx = kcpp_data->n_ctx;
 
-    TokenizeString(kcpp_data->prompt, embd_inp, file_format, add_bos_token);
+    // Check if input_ids were provided (bypasses tokenization)
+    if (inputs.input_ids_len > 0 && inputs.input_ids != nullptr)
+    {
+        // Use provided token IDs directly
+        embd_inp = std::vector<int>(inputs.input_ids, inputs.input_ids + inputs.input_ids_len);
+        if(debugmode==1 && !is_quiet)
+        {
+            printf("\nUsing pre-tokenized input_ids (%d tokens)", inputs.input_ids_len);
+        }
+    }
+    else
+    {
+        // Normal path: tokenize the prompt string
+        TokenizeString(kcpp_data->prompt, embd_inp, file_format, add_bos_token);
+    }
     TokenizeString("\nAttached Media:\n", media_intro, file_format, false);
 
     if(media_composite_image_signature=="")

@@ -36,9 +36,14 @@
 - Essential for attention tensor shape validation
 - Enables model-agnostic client implementations
 
+### ✅ Phase 5: Input Token Control (COMPLETE - Session 10)
+- `input_ids` parameter support for direct token input
+- Bypasses tokenization when provided
+- Enables deterministic token control for context pruning
+- Works with both streaming and non-streaming endpoints
+
 ### ⚠️ What Doesn't Exist
-- No non-streaming `/api/v1/generate` endpoint with attention
-- No `input_ids` parameter support (generation still requires text prompt)
+- No non-streaming `/api/v1/generate` endpoint with attention data exposure
 
 **This document only shows TESTED, WORKING API calls.**
 
@@ -224,27 +229,70 @@ Generate text token-by-token with real-time attention extraction.
 
 **Protocol**: HTTP POST with Server-Sent Events (SSE) response
 
+#### Option A: With Text Prompt (Normal)
+
 **Request**:
 ```bash
 curl -X POST http://localhost:5001/api/extra/generate/stream \
   -H "Content-Type: application/json" \
   -H "Accept: text/event-stream" \
-  --no-buffer \
   -d '{
     "prompt": "The capital of France is",
-    "max_length": 20,
+    "max_length": 3,
     "temperature": 0.7,
-    "output_attentions": true,
-    "request_id": "test-123"
+    "sampler_seed": 12345
   }'
 ```
 
+**ACTUAL Response**:
+```
+event: message
+data: {"token": " _______.
+A.", "finish_reason": null}
+
+event: message
+data: {"token": "", "finish_reason": "length"}
+```
+
+#### Option B: With input_ids (NEW - Session 10)
+
+**Request**:
+```bash
+curl -X POST http://localhost:5001/api/extra/generate/stream \
+  -H "Content-Type: application/json" \
+  -H "Accept: text/event-stream" \
+  -d '{
+    "input_ids": [785, 6722, 315, 9625, 374],
+    "max_length": 3,
+    "temperature": 0.7,
+    "sampler_seed": 12345
+  }'
+```
+
+**ACTUAL Response** (identical to Option A with same seed):
+```
+event: message
+data: {"token": " _______.
+A.", "finish_reason": null}
+
+event: message
+data: {"token": "", "finish_reason": "length"}
+```
+
 **Request Parameters**:
-- `prompt` (string): Text prompt (NOT token IDs)
+- `prompt` (string): Text prompt (ignored if `input_ids` is provided)
+- `input_ids` (array of int32): **NEW** - Pre-tokenized token IDs (bypasses tokenization)
 - `max_length` (int): Maximum tokens to generate
 - `temperature` (float): Sampling temperature
+- `sampler_seed` (int): Random seed for reproducibility
 - `output_attentions` (bool): Enable attention extraction
 - `request_id` (string): Optional request tracking ID
+
+**Notes**:
+- If both `prompt` and `input_ids` are provided, `input_ids` takes precedence
+- ✅ **TESTED**: `input_ids` and `prompt` produce identical output with same seed
+- Use `/api/v1/tokenize` to convert text → token IDs
+- Token IDs from tokenize endpoint = input IDs for generation
 
 **Response Format**: Server-Sent Events (SSE)
 
@@ -432,7 +480,43 @@ for line in response.iter_lines():
 
 ---
 
-**Last Updated**: 2025-11-19 (Session 9 - Model Information API enhanced)
+## Complete Workflow Example: Context Manipulation with input_ids
+
+This demonstrates how to use `input_ids` for deterministic token control:
+
+```python
+import requests
+
+# Step 1: Tokenize your context
+response = requests.post("http://localhost:5001/api/v1/tokenize", json={
+    "text": "The capital of France is",
+    "add_special_tokens": False
+})
+token_ids = response.json()['token_ids']
+# Result: [785, 6722, 315, 9625, 374]
+
+# Step 2: Manipulate token array (e.g., remove token at index 2)
+pruned_ids = token_ids[:2] + token_ids[3:]  # Remove token 315 (" of")
+# Result: [785, 6722, 9625, 374]
+
+# Step 3: Generate with modified tokens
+response = requests.post("http://localhost:5001/api/extra/generate/stream",
+    json={"input_ids": pruned_ids, "max_length": 10},
+    stream=True, headers={"Accept": "text/event-stream"}
+)
+
+# The model generates from the modified context WITHOUT retokenization
+```
+
+**Why This Matters**:
+- ✅ Deterministic: Same token IDs → same behavior every time
+- ✅ Precise control: Manipulate context at token level
+- ✅ No retokenization: Avoid tokenizer quirks after editing
+- ✅ Ready for brightness-based pruning in Halo Weave
+
+---
+
+**Last Updated**: 2025-11-19 (Session 10 - Input Token Control)
 **Tested With**: Qwen2.5-VL-7B-Instruct-Q8_0 (28L, 28H, Q8_0 quantization)
-**Server**: koboldcpp v1.101.1 with custom attention extraction + tokenization patches
-**New in Session 9**: Enhanced `/api/v1/model` endpoint with full architecture metadata (12 fields)
+**Server**: koboldcpp v1.101.1 with custom attention extraction + tokenization + input_ids patches
+**New in Session 10**: `input_ids` parameter for direct token input (bypasses tokenization)
