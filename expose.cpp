@@ -396,6 +396,13 @@ extern "C"
         return detokenized_str.c_str();
     }
 
+    static std::string token_str = ""; //just share a static object for single token conversion
+    const char * token_to_str(int token_id)
+    {
+        token_str = gpttype_token_to_str(token_id, false);
+        return token_str.c_str();
+    }
+
     static std::vector<TopPicksData> last_logprob_toppicks;
     static std::vector<logprob_item> last_logprob_items;
     last_logprobs_outputs last_logprobs()

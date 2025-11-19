@@ -622,6 +622,8 @@ def init_library():
     handle.last_logprobs.restype = last_logprobs_outputs
     handle.detokenize.argtypes = [token_count_outputs]
     handle.detokenize.restype = ctypes.c_char_p
+    handle.token_to_str.argtypes = [ctypes.c_int]
+    handle.token_to_str.restype = ctypes.c_char_p
 
 def set_backend_props(inputs):
     clblastids = 0
@@ -3833,6 +3835,50 @@ Change Mode<br>
                 utfprint("Detokenize Error: " + str(e))
                 response_code = 400
                 response_body = (json.dumps({"result": "","success":False}).encode())
+
+        elif self.path.endswith('/api/v1/tokenize'):
+            if not self.secure_endpoint():
+                return
+            try:
+                genparams = json.loads(body)
+                text = genparams.get('text', genparams.get('content', ""))
+                add_special = genparams.get('add_special_tokens', genparams.get('add_special', False))
+                with_pieces = genparams.get('with_pieces', True)  # Default to True for v1 API
+
+                token_ids = tokenize_ids(text, add_special)
+
+                if with_pieces:
+                    # Return token IDs with text for each token
+                    tokens = []
+                    for token_id in token_ids:
+                        token_text = ctypes.string_at(handle.token_to_str(token_id)).decode("UTF-8", "ignore")
+                        tokens.append({"token_id": token_id, "text": token_text})
+                    response_body = (json.dumps({
+                        "tokens": tokens,
+                        "token_ids": token_ids,
+                        "token_count": len(token_ids)
+                    }).encode())
+                else:
+                    # Return just token IDs (backwards compatible with llama.cpp server)
+                    tokens = [{"id": token_id} for token_id in token_ids]
+                    response_body = (json.dumps({"tokens": tokens}).encode())
+            except Exception as e:
+                utfprint("Tokenize Error: " + str(e))
+                response_code = 400
+                response_body = (json.dumps({"error": str(e)}).encode())
+
+        elif self.path.endswith('/api/v1/detokenize'):
+            if not self.secure_endpoint():
+                return
+            try:
+                genparams = json.loads(body)
+                token_ids = genparams.get('token_ids', genparams.get('tokens', []))
+                detokstr = detokenize_ids(token_ids)
+                response_body = (json.dumps({"text": detokstr}).encode())
+            except Exception as e:
+                utfprint("Detokenize Error: " + str(e))
+                response_code = 400
+                response_body = (json.dumps({"error": str(e)}).encode())
 
         elif self.path.endswith('/api/extra/json_to_grammar'):
             if not self.secure_endpoint():

@@ -7,6 +7,129 @@ This is a fork of KoboldCpp modified to extract attention weights during text ge
 **Fork**: https://github.com/RecursiveRabbit/koboldcpp
 **Upstream**: https://github.com/LostRuins/koboldcpp
 
+---
+
+## Current Status: Output Works, Input Needs Work
+
+**✅ THE HARD PART IS DONE**: Attention extraction is working perfectly!
+- Raw pre-softmax logits
+- Correct shape: `[n_layers, n_heads, seq_len]`
+- Streaming via SSE
+- ~1MB per token, base64-encoded
+- Request tracking functional
+
+**🔧 THE EASY PART**: We just need to figure out how to ingress the data we already have.
+
+We're getting the output we need, in the format we need it. Now we need to adjust how we insert the input.
+
+---
+
+## TODO: Input Control for Halo Weave Integration
+
+### ✅ COMPLETE: Tokenization Endpoints (Session 8 - 2025-11-19)
+
+**Status**: Implemented and tested!
+
+**Endpoints**:
+- `POST /api/v1/tokenize` - Returns token IDs + text for each token
+- `POST /api/v1/detokenize` - Converts token IDs back to text
+
+**Example**:
+```bash
+POST /api/v1/tokenize
+{
+  "text": "Hello, how are you?",
+  "add_special_tokens": false
+}
+→ Response: {
+  "tokens": [
+    {"token_id": 9707, "text": "Hello"},
+    {"token_id": 11, "text": ","},
+    ...
+  ],
+  "token_ids": [9707, 11, ...],
+  "token_count": 6
+}
+```
+
+**Files modified**:
+- `gpttype_adapter.cpp:3234-3249` - Added `gpttype_token_to_str()`
+- `model_adapter.h:106` - Added function declaration
+- `expose.cpp:399-404` - Exposed via C API
+- `koboldcpp.py:625-626` - Python binding
+- `koboldcpp.py:3839-3881` - REST endpoints
+- `test_tokenization.py` - Test suite
+
+**Tests**: ✅ All passing (round-trip tokenize/detokenize works perfectly)
+
+---
+
+### 🔴 CRITICAL: Input Token Control (Input Ingress)
+
+**Problem**: Current API accepts `prompt` (text string), not `input_ids` (token array). Halo Weave needs precise token-level control for:
+- Context pruning (removing specific tokens by ID)
+- Deterministic tokenization (same input → same tokens)
+- Avoiding retokenization of existing context
+
+**Current behavior**:
+```json
+{
+  "prompt": "The capital of France is",  // Text string - we can't control exact tokens!
+  "max_length": 20
+}
+```
+
+**Required behavior**:
+```json
+{
+  "input_ids": [151644, 1587, 198, 2610, ...],  // Exact token IDs
+  "max_length": 20
+}
+```
+
+**Action needed**:
+- Find where koboldcpp.py parses the request and tokenizes the prompt
+- Add support for `input_ids` parameter (bypass tokenization if provided)
+- Verify that attention indices match the provided token array
+
+**Files to investigate**: `koboldcpp.py` (request handlers), possibly C++ generation code
+
+---
+
+### 🟡 NICE TO HAVE: Detailed Model Info (Validation)
+
+**Problem**: `/api/v1/model` only returns model name, not architecture details. We need:
+- `num_layers` and `num_attention_heads` to validate attention tensor shapes
+- `vocab_size` for token validation
+- `max_context_length` for context management
+
+**Current**:
+```json
+{"result": "koboldcpp/Qwen2.5-VL-7B-Instruct-Q8_0"}
+```
+
+**Desired**:
+```json
+{
+  "model_name": "Qwen2.5-VL-7B-Instruct-Q8_0",
+  "num_layers": 28,
+  "num_attention_heads": 28,
+  "vocab_size": 151936,
+  "max_context_length": 32768
+}
+```
+
+**Action needed**:
+- Extract model metadata from loaded GGUF model
+- Expose via enhanced `/api/v1/model` endpoint
+- Model knows this info - make it tell us!
+
+---
+
+### ✅ NOT NEEDED: WebSocket Support
+
+**Status**: Current SSE (Server-Sent Events) implementation works fine for streaming. WebSocket would be nice but not blocking.
+
 ## Motivation
 
 The Positronic Brain/Halo Weave project needs attention weights to visualize which tokens the model attends to during generation. Using HuggingFace Transformers with `output_attentions=True` works but:

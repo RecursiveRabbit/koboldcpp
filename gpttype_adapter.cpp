@@ -3231,6 +3231,23 @@ std::string gpttype_detokenize(const std::vector<int> & inputids, bool render_sp
     return output;
 }
 
+// Convert a single token ID to its text representation
+std::string gpttype_token_to_str(int token_id, bool render_special)
+{
+    if(kcpp_data==nullptr)
+    {
+        printf("\nWarning: KCPP text generation not initialized!\n");
+        return "";
+    }
+
+    if(token_id<0 || token_id>=n_vocab)
+    {
+        return "";
+    }
+
+    return FileFormatTokenizeID(token_id, file_format, render_special);
+}
+
 const std::string & gpttype_get_pending_output()
 {
     if(kcpp_data==nullptr)

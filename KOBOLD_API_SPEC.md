@@ -1,138 +1,88 @@
-# KoboldCPP Attention Extraction API Specification
-## REST and WebSocket APIs for Halo Weave Integration
+# KoboldCPP Attention Extraction API - TESTED DOCUMENTATION
+## Real API Responses and Working Endpoints
 
-**Version**: 2.0
-**Date**: 2025-11-17
-**Purpose**: Define REST and WebSocket APIs for exposing transformer attention patterns during text generation
+**Version**: 3.0 (Reality Edition)
+**Date**: 2025-11-18
+**Status**: ✅ **VERIFIED WORKING** - All endpoints tested with live server
+**Model Tested**: Qwen2.5-VL-7B-Instruct-Q8_0 (28 layers, 28 heads)
 
 ---
 
 ## Implementation Status
 
-### ✅ Phase 1: C++ Extraction Layer (COMPLETE - Session 5)
+### ✅ Phase 1: C++ Extraction Layer (COMPLETE)
 - Unconditional attention tensor extraction at core `process_ubatch()`
 - GPU→CPU copy after graph execution
 - Shape: `[n_layers, n_heads, seq_len]` per token
-- Raw pre-softmax logits (range: -94 to +84)
-- Atomic token+attention pairing
-- Verified working with Qwen 7B (28L, 28H)
+- Raw pre-softmax logits
+- Verified with 20+ token generation
 
-**Files**: `gpttype_adapter.cpp`, `expose.h`, `expose.cpp`, `src/llama-context.cpp`
+### ✅ Phase 2: REST API (COMPLETE)
+- Streaming endpoint `/api/extra/generate/stream` working
+- Token IDs exposed
+- Base64-encoded attention data (~1MB per token)
+- Request ID tracking functional
+- SSE (Server-Sent Events) format
 
-### ✅ Phase 2: REST/WebSocket API (COMPLETE - Session 6)
-- Token IDs exposed via C API `new_token_id()`
-- Streaming endpoint `/api/extra/generate/stream` with `output_attentions=True`
-- Base64 encoding for JSON transmission
-- Complete Token Event JSON with token_id + text + attention
-- Request ID tracking
-- Tested and verified working
+### ✅ Phase 3: Tokenization API (COMPLETE - Session 8)
+- `/api/v1/tokenize` endpoint with token text
+- `/api/v1/detokenize` endpoint
+- Round-trip tokenize/detokenize verified
+- Deterministic tokenization for Halo Weave
 
-**Files**: `koboldcpp.py`, `expose.cpp`, test scripts
+### ⚠️ What Doesn't Exist
+- No `/api/v1/model/info` with architecture details (only basic model name)
+- No non-streaming `/api/v1/generate` endpoint with attention
+- No `input_ids` parameter support (generation still requires text prompt)
 
----
-
-## Executive Summary
-
-This specification defines REST and WebSocket APIs that expose transformer attention patterns during text generation. The goal is to enable **brightness-based context pruning** in Halo Weave by providing real-time attention scores for every token in the conversation.
-
-**Critical requirement**: The API must return **raw per-layer, per-head attention tensors**, not pre-aggregated values, to support flexible aggregation strategies (mean, max, weighted layers, etc.) and advanced features like distance weighting.
-
-**Status**: ✅ **PRODUCTION READY** - Both C++ extraction layer (Session 5) and Python API layer (Session 6) are complete and tested. Ready for Halo Weave integration.
+**This document only shows TESTED, WORKING API calls.**
 
 ---
 
-## Design Principles
+## What Works (Tested)
 
-### 1. Raw Data Over Convenience
-- Return full attention tensors (all layers, all heads) even though it's more data
-- Client decides how to aggregate; server doesn't make assumptions
-- Enables experimentation with different aggregation modes
+### Attention Extraction
+- **Format**: Raw pre-softmax logits (NOT normalized probabilities)
+- **Shape**: `[n_layers, n_heads, seq_len]` per generated token
+- **Size**: ~1.07MB per token (base64-encoded) for 28L/28H model
+- **Encoding**: base64 string in JSON
+- **Note**: First generated token may not have attention data
 
-### 2. Deterministic Tokenization
-- Expose exact tokenizer output so clients can pre-tokenize
-- Token positions must be stable and predictable
-- Client maintains conversation state (token dictionary)
-
-### 3. Position-Based Mapping (CLIENT RESPONSIBILITY)
-- **Position IDs are CLIENT metadata, not exposed in API**
-- Kobold returns attention indexed by input array: `attention[i]` corresponds to `input_ids[i]`
-- Client maintains mapping: `array_index → position_id`
-- This allows client to handle non-sequential position IDs after pruning (e.g., 0,1,2,15,16,65,66...)
-- **Kobold doesn't know or care about position IDs** - it just processes the array you give it
-
-**CRITICAL: KV cache cannot survive pruning**
-- The KV cache is **generation-scoped** and assumes sequential positions
-- You CANNOT delete tokens from the middle of the cache
-- After pruning, you MUST reprocess the entire pruned context to rebuild the KV cache
-- This is expected behavior and relatively cheap (~1-2s for 500 tokens)
-
-### 4. Streaming-First
-- Token-by-token generation with real-time attention
-- Client renders tokens as they arrive
-- WebSocket for low latency
-
-### 5. Memory Efficiency
-- Server doesn't store conversation state
-- Client sends full context on each request
-- Server is stateless (easier to scale, restart, swap models)
+### Streaming Generation
+- **Protocol**: Server-Sent Events (SSE)
+- **Format**: `event: message\ndata: {json}\n\n`
+- **Request tracking**: Works with `request_id` field
+- **Token delivery**: Real-time as generated
 
 ---
 
-## API Endpoints
+## Working API Endpoints
 
-### 1. Model Information
-**`GET /api/v1/model/info`**
+Only endpoints verified by actual testing are documented below.
 
-Get model architecture details needed for attention processing.
+### 1. Tokenization (NEW - Session 8)
 
-**Response**:
-```json
-{
-  "model_name": "Qwen/Qwen2.5-7B-Instruct",
-  "architecture": "Qwen2ForCausalLM",
-  "vocab_size": 151936,
-  "num_layers": 28,
-  "num_attention_heads": 28,
-  "num_key_value_heads": 4,
-  "hidden_size": 3584,
-  "max_position_embeddings": 32768,
-  "rope_theta": 1000000.0,
-  "bos_token_id": 151643,
-  "eos_token_id": 151645,
-  "special_tokens": {
-    "bos_token": "<|endoftext|>",
-    "eos_token": "<|im_end|>",
-    "pad_token": "<|endoftext|>",
-    "im_start_id": 151644,
-    "im_end_id": 151645
-  },
-  "chat_template": "{% for message in messages %}...",
-  "torch_dtype": "bfloat16",
-  "context_length": 32768
-}
-```
-
-**Purpose**:
-- Client needs `num_layers` and `num_attention_heads` to validate attention tensor shapes
-- Special token IDs for banning during sampling (prevent `<|im_start|>` generation)
-- Chat template for formatting conversation
-
----
-
-### 2. Tokenization
+#### Tokenize Text to Token IDs + Text
 **`POST /api/v1/tokenize`**
 
-Convert text to tokens using the model's tokenizer. Enables client-side token dictionary management.
+Convert text to tokens, returning both token IDs and text for each token. Essential for deterministic tokenization in Halo Weave.
 
 **Request**:
-```json
-{
-  "text": "Hello, how are you?",
-  "add_special_tokens": false
-}
+```bash
+curl -X POST http://localhost:5001/api/v1/tokenize \
+  -H "Content-Type: application/json" \
+  -d '{
+    "text": "Hello, how are you?",
+    "add_special_tokens": false
+  }'
 ```
 
-**Response**:
+**Request Parameters**:
+- `text` (string): Text to tokenize
+- `add_special_tokens` (bool): Include BOS/EOS tokens (default: false)
+- `with_pieces` (bool): Return token text alongside IDs (default: true)
+
+**ACTUAL Response** (from Qwen2.5-VL-7B-Instruct-Q8_0):
 ```json
 {
   "tokens": [
@@ -145,15 +95,15 @@ Convert text to tokens using the model's tokenizer. Enables client-side token di
       "text": ","
     },
     {
-      "token_id": 1234,
+      "token_id": 1246,
       "text": " how"
     },
     {
-      "token_id": 527,
+      "token_id": 525,
       "text": " are"
     },
     {
-      "token_id": 499,
+      "token_id": 498,
       "text": " you"
     },
     {
@@ -161,1038 +111,288 @@ Convert text to tokens using the model's tokenizer. Enables client-side token di
       "text": "?"
     }
   ],
-  "token_ids": [9707, 11, 1234, 527, 499, 30],
+  "token_ids": [9707, 11, 1246, 525, 498, 30],
   "token_count": 6
 }
 ```
 
-**Purpose**:
-- Client tokenizes messages ONCE when they enter the conversation
-- Stores tokens in token dictionary with metadata (position, turn_id, sentence_id)
-- Never retokenizes existing context (deterministic, no position drift)
-- **Once tokenized, original text can be discarded** - token list with text fields is the source of truth
-
-**Parameters**:
-- `add_special_tokens`: Whether to add BOS/EOS tokens (usually false for manual conversation assembly)
-
-**Why no character offsets?**
-- We rebuild text from token.text fields, not from source text
-- After pruning, character offsets would be meaningless anyway
-- Simpler API, less data to transmit
+**Notes**:
+- Each token includes both `token_id` and `text` fields
+- Useful for building token dictionaries with metadata
+- Tokenization is deterministic (same text → same tokens)
+- Compatible with context pruning workflows
 
 ---
 
-### 3. Detokenization
+#### Detokenize Token IDs to Text
 **`POST /api/v1/detokenize`**
 
-Convert token IDs back to text. Useful for reconstructing context from token dictionary.
+Convert token IDs back to text. Useful for reconstructing text after context pruning.
 
 **Request**:
-```json
-{
-  "token_ids": [9707, 11, 1234, 527, 499, 30]
-}
+```bash
+curl -X POST http://localhost:5001/api/v1/detokenize \
+  -H "Content-Type: application/json" \
+  -d '{
+    "token_ids": [9707, 11, 1246, 525, 498, 30]
+  }'
 ```
 
-**Response**:
+**Request Parameters**:
+- `token_ids` (array): List of token IDs to convert back to text
+
+**ACTUAL Response**:
 ```json
 {
   "text": "Hello, how are you?"
 }
 ```
 
+**Notes**:
+- Faithful reconstruction of original text
+- Round-trip tokenize/detokenize preserves text exactly
+- Works with any token ID array (useful after pruning)
+
 ---
 
-### 4. Text Generation (Non-Streaming)
-**`POST /api/v1/generate`**
+### 2. Model Information
+**`GET /api/v1/model`**
 
-Generate text with attention extraction (non-streaming, returns complete response).
+Get basic model name.
 
 **Request**:
+```bash
+curl http://localhost:5001/api/v1/model
+```
+
+**ACTUAL Response**:
 ```json
 {
-  "input_ids": [151644, 1587, 198, 2610, ...],
-  "max_new_tokens": 50,
-  "temperature": 0.7,
-  "top_p": 0.9,
-  "top_k": 40,
-  "repetition_penalty": 1.0,
-  "stop_tokens": [151645],
-  "banned_tokens": [151644],
-  "return_attention": true,
-  "attention_format": "per_layer"
+  "result": "koboldcpp/Qwen2.5-VL-7B-Instruct-Q8_0"
 }
 ```
 
-**Response**:
-```json
-{
-  "generated_tokens": [
-    {"token_id": 40, "text": "I"},
-    {"token_id": 2846, "text": "'m"},
-    {"token_id": 3291, "text": " doing"}
-  ],
-  "generated_text": "I'm doing well, thank you for asking!",
-  "finish_reason": "stop_token",
-  "attention_data": [
-    {
-      "token_id": 40,
-      "text": "I",
-      "attention": {
-        "format": "per_layer",
-        "shape": [28, 28, 267],
-        "data": "base64encodeddata..."
-      }
-    }
-  ]
-}
-```
-
-**Purpose**: Simple API for one-shot generation with full attention data.
-
-**Note on positions**: Kobold doesn't track or return position IDs. Client assigns positions when adding tokens to ConversationState.
+**Notes**:
+- Returns ONLY the model name, not architecture details
+- No layer count, head count, vocab size, etc.
+- Client must know model architecture externally
 
 ---
 
-### 5. Text Generation (Streaming WebSocket)
-**`WS /api/v1/generate/stream`**
+### 2. Streaming Text Generation with Attention
+**`POST /api/extra/generate/stream`**
 
-Generate text token-by-token with real-time attention extraction. **This is the primary endpoint for Halo Weave.**
+Generate text token-by-token with real-time attention extraction.
 
-#### Connection
-```javascript
-const ws = new WebSocket('ws://localhost:5001/api/v1/generate/stream');
+**Protocol**: HTTP POST with Server-Sent Events (SSE) response
+
+**Request**:
+```bash
+curl -X POST http://localhost:5001/api/extra/generate/stream \
+  -H "Content-Type: application/json" \
+  -H "Accept: text/event-stream" \
+  --no-buffer \
+  -d '{
+    "prompt": "The capital of France is",
+    "max_length": 20,
+    "temperature": 0.7,
+    "output_attentions": true,
+    "request_id": "test-123"
+  }'
 ```
 
-#### Request Message (Client → Server)
-```json
-{
-  "type": "generate",
-  "request_id": "uuid-1234-5678",
-  "input_ids": [151644, 1587, 198, 2610, ...],
-  "max_new_tokens": 50,
-  "temperature": 0.7,
-  "top_p": 0.9,
-  "top_k": 40,
-  "repetition_penalty": 1.0,
-  "stop_tokens": [151645],
-  "banned_tokens": [151644],
-  "return_attention": true,
-  "attention_format": "per_layer"
-}
+**Request Parameters**:
+- `prompt` (string): Text prompt (NOT token IDs)
+- `max_length` (int): Maximum tokens to generate
+- `temperature` (float): Sampling temperature
+- `output_attentions` (bool): Enable attention extraction
+- `request_id` (string): Optional request tracking ID
+
+**Response Format**: Server-Sent Events (SSE)
+
+Each event follows SSE format:
+```
+event: message
+data: {json}
+
 ```
 
-**Parameters**:
-- `input_ids`: Full conversation context as token IDs (NOT text)
-- `max_new_tokens`: Maximum tokens to generate
-- `stop_tokens`: Stop generation if these tokens are sampled (e.g., `<|im_end|>`)
-- `banned_tokens`: Force logit to `-inf` for these tokens (e.g., `<|im_start|>` to prevent role breaking)
-- `return_attention`: Whether to include attention tensors in response
-- `attention_format`: `"per_layer"` (default) or `"aggregated"` (not recommended)
-
-#### Response Messages (Server → Client)
-
-**Token Event**:
+**Token Event** (ACTUAL tested response, attention data truncated for display):
 ```json
 {
   "type": "token",
-  "request_id": "uuid-1234-5678",
   "token": {
-    "token_id": 40,
-    "text": "I"
+    "token_id": 13,
+    "text": "."
   },
+  "request_id": "test-123",
   "attention": {
     "format": "per_layer",
-    "shape": [28, 28, 267],
-    "context_length": 267,
+    "shape": [28, 28, 256],
+    "context_length": 256,
     "encoding": "base64",
     "dtype": "float32",
-    "data": "AAAA... (base64 encoded)"
+    "data": "dTNEwgpPRkGR/PrBtRrZwaRn78Gm...[1,070,424 chars total]"
   }
 }
 ```
 
-**Attention Data Structure** (after base64 decode):
+**Attention Data**:
 - **Shape**: `[num_layers, num_heads, context_length]`
-- **Format**: **RAW PRE-SOFTMAX LOGITS** (not normalized attention weights)
-- **Interpretation**: Attention logits FROM the newly generated token TO all previous tokens
-- **Example**: For Qwen 7B (28 layers, 28 heads) with 267 tokens in context:
-  - Shape: `[28, 28, 267]`
-  - `attention[layer][head][i]` = raw attention logit from new token to `input_ids[i]`
-  - Client maintains mapping: `input_ids[i]` → conversation position ID
-  - **Value range**: Typically `-100` to `+100` (raw logits before softmax)
-  - **Dynamic range**: ~200 (excellent for brightness scoring!)
-  - **NOT normalized**: Sum does NOT equal 1.0 - these are pre-softmax values
+- **Format**: RAW PRE-SOFTMAX LOGITS (not normalized)
+- **Size**: ~1.07MB base64 for 28 layers × 28 heads × 256 context
+- **Values**: Typically range from -100 to +100
+- **Not normalized**: Sum does NOT equal 1.0
 
-**Why Raw Logits?**
-- **Better dynamic range**: Normalized attention compresses to [0, 1], losing information
-- **Natural decay**: Negative values may eliminate need for artificial decay in brightness tracking
-- **Preserve outliers**: Extreme values (very high/low attention) are not compressed by softmax
-- **Client choice**: Client can apply softmax if needed, but can't reverse it
-
-**Why this shape?**
-- Attention indexed by input array position, NOT conversation position IDs
-- Client maps `input_ids[i]` to position ID using its own metadata
-- Full layer/head breakdown allows flexible aggregation
-- Matches PyTorch `outputs.attentions[layer][batch, head, query, key]` format
-- We extract `[:, :, -1, :]` (attention from last token to all tokens)
-
-**Memory management**:
-- **Attention tensors must be in system RAM, not VRAM**
-- After forward pass, immediately copy attention from GPU to CPU
-- Only model weights and active computation should consume VRAM
-- With 128GB system RAM, storing 75MB per generation is trivial
-- This prevents CUDA OOM errors during long conversations
-
-**Done Event**:
+**Done Event** (ACTUAL tested response):
 ```json
 {
   "type": "done",
-  "request_id": "uuid-1234-5678",
-  "finish_reason": "stop_token",
-  "total_tokens": 23,
-  "generation_time_ms": 1234
+  "finish_reason": "length",
+  "total_tokens": 20,
+  "request_id": "test-123"
 }
 ```
 
-**Error Event**:
-```json
-{
-  "type": "error",
-  "request_id": "uuid-1234-5678",
-  "error": "CUDA out of memory",
-  "error_code": "OOM"
-}
-```
+**Important Notes**:
+- First generated token often has `"attention": null`
+- Subsequent tokens include attention data
+- Attention is indexed by prompt position, not conversation position IDs
+- Client must handle base64 decoding and array reshaping
 
 ---
 
-## Data Format Details
+## Decoding Attention Data (Python Example)
 
-### Attention Tensor Encoding
-
-**Recommended format**: Base64-encoded NumPy array (float32)
-
-**Why?**
-- JSON-serializable (can send over WebSocket)
-- Compact (much smaller than JSON array of floats)
-- Fast to decode client-side (`base64.b64decode()` + `np.frombuffer()`)
-
-**Alternative formats** (for optimization):
-- **MessagePack**: Binary protocol, more efficient than JSON
-- **FlatBuffers**: Zero-copy deserialization
-- **Raw binary WebSocket**: Maximum efficiency (not JSON)
-
-**Reference implementation** (Python server side with KoboldCPP C++ layer):
+**Server encodes** (already implemented in koboldcpp.py):
 ```python
 import numpy as np
 import base64
-import ctypes
 
-# Get attention from C++ extraction layer (raw pre-softmax logits)
-# C++ layer returns: g_attention.buffer with shape [n_layers, n_heads, seq_len]
-attention_output = handle.get_token_attention(token_idx)
+# Get attention from C++ layer (float32 array)
+attention_np = ...  # shape: [n_layers, n_heads, seq_len]
 
-if attention_output.valid:
-    # Convert C pointer to numpy array
-    attention_np = np.ctypeslib.as_array(
-        attention_output.data,
-        shape=(attention_output.n_layers, attention_output.n_heads, attention_output.seq_len)
-    )
-    # Shape: (num_layers, num_heads, seq_len)
-    # Values: Raw pre-softmax logits (NOT normalized!)
-
-    # Already float32 from C++ layer
-    # Encode as base64
-    attention_bytes = attention_np.tobytes()
-    attention_base64 = base64.b64encode(attention_bytes).decode('ascii')
-
-    # Send in JSON
-    response = {
-        "attention": {
-            "format": "per_layer",
-            "shape": list(attention_np.shape),
-            "encoding": "base64",
-            "dtype": "float32",
-            "data": attention_base64
-        }
-    }
+# Encode to base64
+attention_bytes = attention_np.tobytes()
+attention_b64 = base64.b64encode(attention_bytes).decode('ascii')
 ```
 
-**Client-side decode** (Python):
+**Client decodes**:
 ```python
 import numpy as np
 import base64
 
-# Receive JSON
-attention_info = response["attention"]
+# Parse JSON response
+token_event = json.loads(event_data)
+attention_info = token_event["attention"]
 
-# Decode base64
+# Decode base64 to bytes
 attention_bytes = base64.b64decode(attention_info["data"])
 
-# Reconstruct NumPy array
+# Convert to numpy array
 attention = np.frombuffer(attention_bytes, dtype=np.float32)
 attention = attention.reshape(attention_info["shape"])
 
-# Shape: (num_layers, num_heads, context_length)
-# Now pass to AttentionTracker.update_attention()
+# Result: numpy array with shape [28, 28, 256]
+# attention[layer, head, position] = raw logit value
 ```
 
-**Memory cost**:
-- Example: 28 layers × 28 heads × 500 tokens × 4 bytes (float32) = **1.5 MB per token**
-- For 50-token generation: **75 MB total attention data**
-- This is acceptable for local inference (no network egress costs)
-
-**Optimization**: Only send attention if `return_attention=true` (for normal generation, skip it)
+**Memory**: ~1MB per token with attention data
 
 ---
 
-## Integration with Halo Weave
+## Complete Working Example (Tested)
 
-### Requirements for Halo Weave Changes
-
-**This spec places requirements on attention_heatmap, not just KoboldCPP**. The following changes would need to be made to attention_heatmap to work with this API:
-
-#### 1. Dynamic Model Configuration (BREAKING CHANGE)
-
-**Current behavior**: Special tokens and chat templates are hardcoded in `text_generator.py`
-
-**Required change**: Query `/api/v1/model/info` on startup and use returned values
-- `special_tokens.im_start_id`, `special_tokens.im_end_id` for banning
-- `num_layers`, `num_attention_heads` for validation
-- `chat_template` for formatting (if implementing client-side chat formatting)
-
-**Implementation location**: `backend/services/text_generator.py` or new `backend/services/kobold_client.py`
-
-**Why this matters**: Makes attention_heatmap model-agnostic. Can swap models in KoboldCPP without modifying attention_heatmap code.
-
-#### 2. Adapter Layer
-
-**Create new file**: `backend/services/kobold_client.py`
-- Wraps KoboldCPP API calls
-- Handles tokenization via `/api/v1/tokenize`
-- Manages WebSocket connection to `/api/v1/generate/stream`
-- Decodes base64 attention tensors
-- Converts NumPy arrays back to PyTorch tuple format for AttentionTracker
-
-**Why separate?**: Isolates KoboldCPP-specific logic. If API changes, only this file needs updating.
-
-#### 3. Array Index to Position ID Mapping
-
-**Current behavior**: AttentionTracker expects attention indexed by conversation position
-
-**Required change**: Add mapping layer in attention flow
-
-**The problem**: After pruning, position IDs become non-sequential
-```python
-# Before pruning: positions are sequential
-conversation_state.tokens = [
-    TokenAttention(position=0, token="Hello"),
-    TokenAttention(position=1, token=","),
-    TokenAttention(position=2, token=" world"),
-]
-input_ids = [9707, 11, 1234]  # len=3
-
-# After pruning: position 1 is deleted, but positions don't renumber
-conversation_state.tokens = [
-    TokenAttention(position=0, token="Hello", deleted=False),
-    TokenAttention(position=1, token=",", deleted=True),  # DELETED
-    TokenAttention(position=2, token=" world", deleted=False),
-]
-input_ids = [9707, 1234]  # len=2 (skips deleted token)
-
-# Kobold returns attention shape: [layers, heads, 2]
-# attention[:, :, 0] → input_ids[0] → position 0 ✓
-# attention[:, :, 1] → input_ids[1] → position 2 (NOT 1!) ✓
-```
-
-**Solution**: Build index-to-position mapping before generation
-```python
-active_tokens = [t for t in conversation_state.tokens if not t.deleted]
-index_to_position = {i: token.position for i, token in enumerate(active_tokens)}
-# {0: 0, 1: 2}
-
-# When processing attention:
-for i in range(len(attention[0, 0, :])):
-    position = index_to_position[i]
-    score = attention[:, :, i].mean()  # or other aggregation
-    conversation_state.tokens[position].attention_score = score
-```
-
-**Why needed**: Kobold returns attention indexed by input array, not by position ID. After pruning, these diverge.
-
-#### 4. Remove PyTorch Model Loading
-
-**Files to modify/delete**:
-- Remove `AutoModelForCausalLM.from_pretrained()` code from `text_generator.py`
-- Remove `transformers` dependency (or keep only for tokenizer if not using Kobold's)
-- Remove CUDA device management code
-
-**Why**: KoboldCPP handles model loading. Attention_heatmap becomes a pure client.
-
-#### 5. Base64 Attention Decoding
-
-**Add to** `backend/services/kobold_client.py`:
-```python
-def _decode_attention(self, attention_info):
-    """Decode base64 attention to tuple of PyTorch tensors"""
-    import base64
-    import numpy as np
-    import torch
-
-    # Decode base64
-    attention_bytes = base64.b64decode(attention_info["data"])
-    attention_np = np.frombuffer(attention_bytes, dtype=np.float32)
-    attention_np = attention_np.reshape(attention_info["shape"])
-
-    # Convert to tuple of tensors (AttentionTracker expects this)
-    num_layers = attention_np.shape[0]
-    attention_tensors = tuple(
-        torch.from_numpy(attention_np[i:i+1, :, :])
-        for i in range(num_layers)
-    )
-
-    return attention_tensors
-```
-
-**Why**: AttentionTracker expects `Tuple[torch.Tensor, ...]`, not NumPy array
-
-#### 6. Documentation Updates
-
-**Update** `CLAUDE.md`:
-- Document KoboldCPP as the inference backend
-- Remove PyTorch-specific setup instructions
-- Add KoboldCPP API URL configuration
-- Document model info querying requirement
-
-**Why**: Future Claude needs to know the architecture has changed
-
----
-
-### Current Halo Weave Architecture
-
-**ConversationState** (`text_generator.py`):
-- Maintains master token list with metadata (position, turn_id, sentence_id, attention_score)
-- Tokenizes messages ONCE when added to conversation
-- Provides `get_input_ids()` to convert token dictionary → input_ids for model
-
-**AttentionTracker** (`attention_tracker.py`):
-- Receives raw attention tensors from model
-- Aggregates across layers/heads (mean/max/weighted/last_layer)
-- Applies distance weighting (filter local attention)
-- Accumulates scores over time: `score = old_score + attention - decay_rate`
-- Syncs updated scores back to ConversationState
-
-### Integration Flow
-
-1. **User sends message**:
-   - Halo Weave calls `/api/v1/tokenize` with message text
-   - Stores tokens in ConversationState with metadata
-   - Increments turn counter, sentence counter
-
-2. **Generate response**:
-   - Halo Weave calls `ConversationState.get_input_ids()` to get full context
-   - Opens WebSocket to `/api/v1/generate/stream`
-   - Sends `input_ids` (NOT text) with generation parameters
-
-3. **Receive tokens**:
-   - For each token event:
-     - Decode attention data from base64
-     - Reshape to `(num_layers, num_heads, context_length)`
-     - Convert to PyTorch tensor or keep as NumPy
-     - Pass to `AttentionTracker.update_attention(attentions, token_obj, step, conversation_tokens)`
-     - Tracker aggregates, applies distance weighting, updates scores
-     - Sync scores back to ConversationState
-     - Display token in UI with color-coded brightness
-
-4. **End of generation**:
-   - Receive `{"type": "done"}` event
-   - Check if context exceeds threshold
-   - If yes, prune low-brightness sentences
-   - Send pruning events to frontend for animation
-
-### Adapter Layer (Recommended)
-
-Create `kobold_client.py` in Halo Weave to handle KoboldCPP-specific logic:
-
-```python
-class KoboldClient:
-    def __init__(self, base_url="http://localhost:5001"):
-        self.base_url = base_url
-        self.ws = None
-
-    async def get_model_info(self):
-        """Get model architecture details"""
-        async with aiohttp.ClientSession() as session:
-            async with session.get(f"{self.base_url}/api/v1/model/info") as resp:
-                return await resp.json()
-
-    def tokenize(self, text: str) -> List[TokenAttention]:
-        """Tokenize text and return token objects ready for ConversationState"""
-        response = requests.post(f"{self.base_url}/api/v1/tokenize", json={
-            "text": text,
-            "add_special_tokens": False
-        })
-        data = response.json()
-
-        tokens = []
-        for idx, token_data in enumerate(data["tokens"]):
-            tokens.append(TokenAttention(
-                token=token_data["text"],
-                token_id=token_data["token_id"],
-                position=None,  # ConversationState assigns this
-                attention_score=1.0,  # Fail bright
-                turn_id=None,  # ConversationState assigns this
-                message_role=None,
-                sentence_id=None,
-                line_id=None,
-                deleted=False
-            ))
-        return tokens
-
-    async def generate_stream(self, input_ids, config, on_token_callback):
-        """Stream generation with real-time attention"""
-        self.ws = await websockets.connect(f"{self.base_url}/api/v1/generate/stream")
-
-        # Send generation request
-        await self.ws.send(json.dumps({
-            "type": "generate",
-            "request_id": str(uuid.uuid4()),
-            "input_ids": input_ids,
-            "max_new_tokens": config.max_length,
-            "temperature": config.temperature,
-            "top_p": config.top_p,
-            "return_attention": True,
-            "attention_format": "per_layer",
-            "banned_tokens": [self.tokenizer.im_start_id] if hasattr(self.tokenizer, 'im_start_id') else []
-        }))
-
-        # Receive token stream
-        async for message in self.ws:
-            data = json.loads(message)
-
-            if data["type"] == "token":
-                # Decode attention
-                attention = self._decode_attention(data["attention"])
-
-                # Call user's callback
-                await on_token_callback(
-                    token_id=data["token"]["token_id"],
-                    token_text=data["token"]["text"],
-                    attention=attention
-                )
-
-            elif data["type"] == "done":
-                break
-
-            elif data["type"] == "error":
-                raise Exception(data["error"])
-
-        await self.ws.close()
-
-    def _decode_attention(self, attention_info):
-        """Decode base64 attention data to NumPy array or PyTorch tensor"""
-        attention_bytes = base64.b64decode(attention_info["data"])
-        attention_np = np.frombuffer(attention_bytes, dtype=np.float32)
-        attention_np = attention_np.reshape(attention_info["shape"])
-
-        # Convert to PyTorch tensor (AttentionTracker expects this)
-        # Convert back to tuple of tensors (one per layer)
-        num_layers = attention_np.shape[0]
-        attention_tensors = tuple(
-            torch.from_numpy(attention_np[i:i+1, :, :]) for i in range(num_layers)
-        )
-
-        return attention_tensors
-```
-
----
-
-## Alternative: Aggregated Attention (NOT RECOMMENDED)
-
-If bandwidth or latency is a concern, KoboldCPP could offer pre-aggregated attention:
-
-**Request**:
-```json
-{
-  "attention_format": "aggregated",
-  "aggregation_mode": "mean"
-}
-```
-
-**Response** (much smaller):
-```json
-{
-  "type": "token",
-  "token": {...},
-  "attention": {
-    "format": "aggregated",
-    "shape": [267],
-    "data": [0.0023, 0.0045, 0.0012, ...]
-  }
-}
-```
-
-**Attention shape**: `[context_length]` - one score per token
-
-**Why NOT recommended**:
-- Loses flexibility (can't change aggregation mode without re-generating)
-- Halo Weave has 5 aggregation modes (mean, max, weighted_layers, last_layer, etc.)
-- Client-side aggregation is cheap (few milliseconds)
-- Server shouldn't make UX decisions for the client
-
-**When to use**: Production deployment with bandwidth constraints or mobile clients
-
----
-
-## Error Handling
-
-### Common Errors
-
-**OOM (Out of Memory)**:
-```json
-{
-  "type": "error",
-  "error": "CUDA out of memory",
-  "error_code": "OOM",
-  "context_length": 8192,
-  "vram_used_mb": 23456,
-  "vram_total_mb": 24576
-}
-```
-
-**Invalid Input**:
-```json
-{
-  "type": "error",
-  "error": "Token ID 999999 not in vocabulary (vocab_size=151936)",
-  "error_code": "INVALID_TOKEN"
-}
-```
-
-**Model Not Loaded**:
-```json
-{
-  "type": "error",
-  "error": "No model loaded",
-  "error_code": "NO_MODEL"
-}
-```
-
----
-
-## Performance Considerations
-
-### Attention Tensor Size
-
-**Calculation**:
-```
-Size = num_layers × num_heads × context_length × 4 bytes (float32)
-
-Examples:
-- Qwen 7B (28 layers, 28 heads, 500 tokens): 1.5 MB per token
-- Llama 7B (32 layers, 32 heads, 500 tokens): 2.0 MB per token
-- Qwen 14B (40 layers, 40 heads, 500 tokens): 3.1 MB per token
-```
-
-**Mitigation strategies**:
-1. **Only send when needed**: `return_attention=false` for normal generation
-2. **Compression**: gzip the base64 data (often 10x reduction for attention patterns)
-3. **Sparse attention**: Send only top-K attention weights per token
-4. **Half precision**: Use float16 instead of float32 (2x smaller, minimal accuracy loss)
-
-### Latency
-
-**Bottlenecks**:
-1. **Model forward pass**: ~50-200ms per token (GPU-bound)
-2. **Attention extraction**: ~1-5ms (copy from GPU to CPU)
-3. **Base64 encoding**: ~5-20ms (CPU-bound, scales with context length)
-4. **WebSocket transmission**: ~1-10ms (network-bound)
-
-**Total latency per token**: ~60-250ms (dominated by model inference, not attention encoding)
-
-**Optimization**: Run encoding/transmission in parallel with next forward pass
-
----
-
-## Security Considerations
-
-### Input Validation
-
-- **Token IDs**: Validate all token IDs are in `[0, vocab_size)`
-- **Context length**: Reject if `len(input_ids) > max_position_embeddings`
-- **Banned tokens**: Validate banned token IDs exist in vocabulary
-
-### Resource Limits
-
-- **Max tokens per request**: Prevent infinite generation
-- **Max context length**: Prevent OOM attacks
-- **Rate limiting**: Prevent API abuse
-- **Timeout**: Kill generation after N seconds
-
-### WebSocket Security
-
-- **Authentication**: Token-based auth for production
-- **Origin validation**: Check `Origin` header
-- **Message size limits**: Prevent memory exhaustion
-
----
-
-## Testing & Validation
-
-### Unit Tests
-
-1. **Tokenization consistency**: Same text → same tokens every time
-2. **Attention shape validation**: Verify `(num_layers, num_heads, seq_len)`
-3. **Base64 encoding**: Round-trip test (encode → decode → compare)
-4. **Stop token handling**: Generation stops when stop token sampled
-
-### Integration Tests
-
-1. **Halo Weave end-to-end**: Full conversation with attention tracking
-2. **Memory leak test**: Generate 1000 tokens, check memory usage
-3. **Concurrent requests**: Multiple WebSocket connections
-4. **Model switching**: Unload model A, load model B, verify attention shape changes
-
-### Validation Checklist
-
-- [ ] Attention tensor shape matches `(num_layers, num_heads, context_length)`
-- [ ] Attention values are raw pre-softmax logits (typically -100 to +100)
-- [ ] Sum across context dimension is NOT 1.0 (raw logits, not normalized)
-- [ ] Token positions map correctly to attention indices
-- [ ] Special tokens (BOS, EOS, im_start, im_end) handled correctly
-- [ ] Stop tokens terminate generation
-- [ ] Banned tokens never appear in output
-- [ ] OOM errors handled gracefully
-- [ ] WebSocket reconnection works after disconnect
-
----
-
-## Future Extensions
-
-### 1. Sparse Attention
-Only send top-K attention weights per token:
-```json
-{
-  "attention": {
-    "format": "sparse",
-    "top_k": 50,
-    "data": [
-      {"position": 245, "layers": [0.023, 0.045, ...]},
-      {"position": 198, "layers": [0.019, 0.038, ...]}
-    ]
-  }
-}
-```
-
-### 2. Attention Visualization Data
-Pre-compute attention aggregations for visualization:
-```json
-{
-  "attention": {
-    "format": "viz",
-    "mean_by_layer": [0.002, 0.003, ...],
-    "max_by_layer": [0.045, 0.067, ...],
-    "entropy": 4.23
-  }
-}
-```
-
-### 3. Multi-Turn Pruning
-Server maintains short-term history and suggests pruning points:
-```json
-{
-  "type": "pruning_suggestion",
-  "prunable_sentences": [
-    {"turn_id": 1, "sentence_id": 3, "max_attention": 0.05}
-  ]
-}
-```
-
-### 4. Batch Generation
-Generate multiple responses in parallel (for sampling, beam search):
-```json
-{
-  "input_ids": [...],
-  "num_samples": 4,
-  "return_attention": true
-}
-```
-
----
-
-## Appendix A: Complete Example Flow
-
-### Scenario: User asks "What is the capital of France?"
-
-**Step 1: Tokenize user message**
+**Start the server**:
 ```bash
-POST /api/v1/tokenize
-{
-  "text": "What is the capital of France?",
-  "add_special_tokens": false
-}
-
-Response:
-{
-  "tokens": [
-    {"token_id": 3555, "text": "What"},
-    {"token_id": 374, "text": " is"},
-    {"token_id": 279, "text": " the"},
-    {"token_id": 6864, "text": " capital"},
-    {"token_id": 315, "text": " of"},
-    {"token_id": 9822, "text": " France"},
-    {"token_id": 30, "text": "?"}
-  ]
-}
+python3 koboldcpp.py \
+  --model /path/to/model.gguf \
+  --port 5001 \
+  --usecublas 0 \
+  --gpulayers 999 \
+  --contextsize 512
 ```
 
-**Step 2: Halo Weave stores tokens**
+**Test the API** (Python):
 ```python
-conversation_state.add_message(
-    role="user",
-    tokens=[
-        TokenAttention(token="What", token_id=3555, position=0, ...),
-        TokenAttention(token=" is", token_id=374, position=1, ...),
-        ...
-    ]
-)
-```
-
-**Step 3: Build input_ids for generation**
-```python
-input_ids = conversation_state.get_input_ids()
-# [151644, 1587, 198, ..., 3555, 374, 279, 6864, 315, 9822, 30]
-# <|im_start|>system\nYou are...<|im_end|><|im_start|>user\nWhat is...
-```
-
-**Step 4: Open WebSocket and send generation request**
-```javascript
-ws.send(JSON.stringify({
-  "type": "generate",
-  "input_ids": input_ids,
-  "max_new_tokens": 50,
-  "temperature": 0.7,
-  "return_attention": true
-}))
-```
-
-**Step 5: Receive token stream**
-
-Token 1: "The"
-```json
-{
-  "type": "token",
-  "token": {"token_id": 791, "text": "The"},
-  "attention": {
-    "shape": [28, 28, 267],
-    "data": "AAAA..."
-  }
-}
-```
-
-Halo Weave:
-1. Decodes attention: `(28 layers, 28 heads, 267 tokens)`
-2. Passes to AttentionTracker
-3. Tracker aggregates: `(267,)` - one score per token
-4. Applies distance weighting
-5. Updates scores: `score = old_score + weighted_attention - decay_rate`
-6. Syncs to ConversationState
-7. Displays "The" in UI, updates heatmap colors
-
-Token 2: " capital"
-```json
-{
-  "type": "token",
-  "token": {"token_id": 6864, "text": " capital"},
-  "attention": {
-    "shape": [28, 28, 268],
-    "data": "BBBB..."
-  }
-}
-```
-
-Note: context_length incremented (267 → 268) because "The" was added
-
-... (repeat for 10 more tokens) ...
-
-**Step 6: Generation complete**
-```json
-{
-  "type": "done",
-  "finish_reason": "stop_token",
-  "total_tokens": 12
-}
-```
-
-Halo Weave:
-1. Checks context length: 279 tokens
-2. If > max_context_tokens (500), prune low-brightness sentences
-3. Updates UI with final message
-4. Closes WebSocket
-
----
-
-## Appendix B: Attention Extraction Implementation Notes
-
-### Phase 1: C++ Extraction (IMPLEMENTED ✅)
-
-**Deferred Extraction Approach**:
-
-The key insight: Callbacks fire during graph *construction*, not execution. Tensors don't have data yet.
-
-**Solution** (implemented in `gpttype_adapter.cpp`):
-1. **Callback stores pointers**: `attention_capture_callback()` stores tensor pointers in `g_pending_attentions`
-2. **Post-decode extraction**: `extract_pending_attention_data()` runs after `llama_decode()` completes
-3. **GPU→CPU copy**: Use `ggml_backend_tensor_get()` - buffers exist now
-4. **Transpose**: `[seq_len_k, n_heads]` → `[n_heads, seq_len_k]`
-5. **Store**: Append to `g_attention.buffer` for API access
-
-**Why it works**:
-- Graph cached in `llama_context::gf_res_prev` for reuse
-- Tensor pointers remain valid until next decode
-- Extract within safe window (after compute, before next decode)
-
-**Key code locations**:
-- `gpttype_adapter.cpp:246-268` - Callback stores pointers
-- `gpttype_adapter.cpp:271-343` - Post-decode extraction
-- `gpttype_adapter.cpp:4216-4220` - Hook after `llama_decode()`
-
-### Phase 2: API Layer (TO BE IMPLEMENTED 🔨)
-
-**Key files to modify**:
-1. `koboldcpp.py` - Add REST/WebSocket endpoints
-2. API handlers - Encode attention data as base64, send via JSON
-3. Model info - Expose num_layers, num_heads to API
-
-**Python API implementation using C++ extraction layer**:
-```python
-import ctypes
-import numpy as np
-import base64
+import requests
 import json
+import base64
+import numpy as np
 
-# In koboldcpp.py streaming handler
+# Stream generation with attention
+response = requests.post(
+    "http://localhost:5001/api/extra/generate/stream",
+    json={
+        "prompt": "The capital of France is",
+        "max_length": 20,
+        "temperature": 0.7,
+        "output_attentions": True,
+        "request_id": "test-123"
+    },
+    stream=True,
+    headers={"Accept": "text/event-stream"}
+)
 
-# After each token is generated...
-token_idx = handle.get_stream_count() - 1  # Latest token
-
-# Get attention from C++ layer
-attention_output = handle.get_token_attention(token_idx)
-
-if attention_output.valid:
-    # Convert C pointer to numpy array
-    attention_np = np.ctypeslib.as_array(
-        attention_output.data,
-        shape=(attention_output.n_layers, attention_output.n_heads, attention_output.seq_len)
-    )
-
-    # Shape: (num_layers, num_heads, seq_len)
-    # Already in correct format! C++ layer does the extraction and transpose
-
-    # Encode as base64 for JSON
-    attention_bytes = attention_np.tobytes()
-    attention_base64 = base64.b64encode(attention_bytes).decode('ascii')
-
-    # Send via WebSocket
-    await websocket.send(json.dumps({
-        "type": "token",
-        "token": {
-            "token_id": token_id,
-            "text": token_text
-        },
-        "attention": {
-            "format": "per_layer",
-            "shape": [attention_np.shape[0], attention_np.shape[1], attention_np.shape[2]],
-            "encoding": "base64",
-            "dtype": "float32",
-            "data": attention_base64
-        }
-    }))
+# Process stream
+for line in response.iter_lines():
+    if not line:
+        continue
+    
+    line = line.decode('utf-8')
+    if line.startswith('data: '):
+        data = json.loads(line[6:])
+        
+        if data["type"] == "token":
+            token_text = data["token"]["text"]
+            print(f"Token: {token_text}")
+            
+            if data.get("attention"):
+                # Decode attention
+                attn_b64 = data["attention"]["data"]
+                attn_bytes = base64.b64decode(attn_b64)
+                attn = np.frombuffer(attn_bytes, dtype=np.float32)
+                attn = attn.reshape(data["attention"]["shape"])
+                print(f"  Attention shape: {attn.shape}")
+        
+        elif data["type"] == "done":
+            print(f"Done: {data['total_tokens']} tokens")
+            break
 ```
-
-**Key differences from PyTorch approach**:
-- No `model.forward()` call - C++ layer handles this
-- No tensor extraction from `outputs.attentions` - already done
-- No transpose needed - C++ layer returns `[n_layers, n_heads, seq_len]`
-- Just read buffer, encode, send
-
-**Actual implementation in gpttype_adapter.cpp** (deferred extraction):
-```cpp
-// Global storage
-static AttentionCapture g_attention;  // Pre-allocated 128MB buffer
-static std::vector<PendingAttentionTensor> g_pending_attentions;
-
-struct PendingAttentionTensor {
-    ggml_tensor * tensor;
-    int layer_idx;
-};
-
-// Phase 1: Callback during graph construction - just store pointers
-void attention_capture_callback(const llama_ubatch & ubatch,
-                                ggml_tensor * cur,
-                                const char * name,
-                                int il) {
-    if (!g_attention.enabled || strcmp(name, "kq_soft_max") != 0) return;
-    if (seq_len_q != 1 || batch != 1) return;  // Single-token generation only
-
-    g_pending_attentions.push_back({cur, il});  // Store pointer, don't copy
-}
-
-// Phase 2: After llama_decode() - NOW extract data
-void extract_pending_attention_data() {
-    g_attention.reset();  // Clear for this token (preserves 'enabled' flag)
-
-    for (const auto & pending : g_pending_attentions) {
-        // NOW buffers exist - safe to copy
-        ggml_backend_tensor_get(pending.tensor, temp_buffer, 0, tensor_bytes);
-
-        // Transpose [seq_len_k, n_heads] → [n_heads, seq_len_k]
-        // ... transpose code ...
-
-        g_attention.append_layer(transposed, n_heads, seq_len_k);
-    }
-
-    g_pending_attentions.clear();
-}
-
-// Hook in main generation loop (after decode)
-if (evalres && embd.size() == 1 && startedsampling) {
-    extract_pending_attention_data();
-}
-```
-
-**Performance**: Attention extraction adds ~5-10% overhead (GPU→CPU copy). Only enable when `output_attentions=true`.
 
 ---
 
-## Conclusion
+## Summary
 
-This API specification prioritizes **flexibility, correctness, and debuggability** over convenience. By exposing raw attention tensors, we enable Halo Weave to experiment with different aggregation strategies, distance weighting modes, and pruning thresholds without requiring server-side changes.
+### What Works ✅
+1. **GET /api/v1/model** - Returns model name
+2. **POST /api/v1/tokenize** - Tokenize text to token IDs + text (NEW)
+3. **POST /api/v1/detokenize** - Convert token IDs back to text (NEW)
+4. **POST /api/extra/generate/stream** - Streaming generation with attention
+5. Attention extraction: Raw pre-softmax logits, shape `[layers, heads, context]`
+6. Base64 encoding for JSON transmission
+7. Request ID tracking
+8. SSE protocol for real-time streaming
 
-The stateless design keeps KoboldCPP simple (no conversation state management) while giving Halo Weave full control over the token dictionary and attention accumulation logic.
+### What Doesn't Exist ❌
+- No detailed model info endpoint (only basic name)
+- No non-streaming generation with attention
+- No WebSocket support (uses HTTP + SSE instead)
+- No `input_ids` parameter for generation (still requires text prompt)
 
-### Current Status
+### For Halo Weave Integration
+- ✅ Tokenization available via `/api/v1/tokenize` (deterministic)
+- ✅ Detokenization available via `/api/v1/detokenize` (for reconstruction)
+- Client must map attention indices to conversation positions
+- Attention is indexed by input prompt array position
+- KV cache cannot survive pruning - must reprocess context after pruning
+- ⏳ Next step: Add `input_ids` parameter to generation endpoints
 
-**Phase 1 (COMPLETE ✅)**: C++ extraction layer - Session 5 (2025-11-18)
-- Unconditional extraction at core `process_ubatch()`
-- GPU→CPU copy working reliably
-- Raw pre-softmax logits (range: -94 to +84)
-- Correct shape: `[n_layers, n_heads, seq_len]` per token
-- Verified with Qwen 7B Q8_0 model
+**Backup of Original Spec**: See `KOBOLD_API_SPEC_ASPIRATIONAL.md` for the original design document with planned features.
 
-**Phase 2 (COMPLETE ✅)**: Python API layer - Session 6 (2025-11-18)
-- Streaming endpoint `/api/extra/generate/stream` working
-- Token IDs exposed via `new_token_id()` C API
-- Base64 encoding and JSON transmission implemented
-- Complete Token Event JSON with token_id + text + attention
-- Request ID tracking functional
-- Tested and verified with streaming generation
+---
 
-**Phase 3 (FUTURE)**: Optimization and advanced features
-- Sparse attention (top-K values only)
-- Compression (gzip, delta encoding)
-- Multi-batch support
-- Performance tuning
-
-**Status**: ✅ PRODUCTION READY - The complete pipeline from C++ extraction to streaming JSON API is working and tested. Ready for Halo Weave integration!
+**Last Updated**: 2025-11-19 (Session 8 - Tokenization API added)
+**Tested With**: Qwen2.5-VL-7B-Instruct-Q8_0 (28L, 28H, Q8_0 quantization)
+**Server**: koboldcpp v1.101.1 with custom attention extraction + tokenization patches
+**New in Session 8**: `/api/v1/tokenize` and `/api/v1/detokenize` endpoints
