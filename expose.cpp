@@ -295,6 +295,12 @@ extern "C"
         return generated_tokens[idx].token_text.c_str();
     }
 
+    int new_token_id(int idx) {
+        if (generated_tokens.size() <= idx || idx < 0) return -1;
+
+        return generated_tokens[idx].token_id;
+    }
+
     int get_stream_count() {
         return generated_tokens.size();
     }

@@ -1,0 +1,60 @@
+{
+  "description": "Complete Token Event JSON from KoboldCPP Streaming API",
+  "endpoint": "/api/extra/generate/stream",
+  "method": "POST with output_attentions=True",
+  "example": {
+    "type": "token",
+    "request_id": "example-request-123",
+    "token": {
+      "token_id": 13,
+      "text": "."
+    },
+    "attention": {
+      "format": "per_layer",
+      "shape": [28, 28, 256],
+      "context_length": 256,
+      "encoding": "base64",
+      "dtype": "float32",
+      "data": "sNCcP7KRvj6Udm7AOwKCwBrE+r4QyFa/GkeSv... [1,070,424 chars total]",
+      "data_size_kb": 802,
+      "notes": [
+        "Raw pre-softmax logits (NOT normalized)",
+        "Value range: typically -100 to +100",
+        "Dynamic range: ~200 (excellent for brightness scoring)",
+        "28 layers × 28 heads × 256 context tokens = 200,704 float32 values",
+        "Base64-encoded for JSON transmission"
+      ]
+    }
+  },
+  "decoding_example": {
+    "python": [
+      "import base64",
+      "import numpy as np",
+      "",
+      "# Decode base64 → numpy array",
+      "attention_bytes = base64.b64decode(event['attention']['data'])",
+      "attention = np.frombuffer(attention_bytes, dtype=np.float32)",
+      "attention = attention.reshape((28, 28, 256))",
+      "",
+      "# attention[layer][head][context_pos] = raw logit",
+      "# Higher values = more attention to that position"
+    ]
+  },
+  "use_cases": {
+    "brightness_scoring": "Average across layers/heads to get per-token brightness score",
+    "attention_visualization": "Render heatmap showing which tokens attend to which",
+    "context_pruning": "Delete tokens with consistently low attention (dim tokens)"
+  },
+  "comparison": {
+    "normalized_attention": {
+      "range": "[0, 1]",
+      "sum": "1.0 (per head)",
+      "problem": "Compressed dynamic range loses information"
+    },
+    "raw_logits": {
+      "range": "[-100, +100]",
+      "sum": "varies (NOT normalized)",
+      "advantage": "Full dynamic range, preserves outliers, natural decay"
+    }
+  }
+}

@@ -99,11 +99,11 @@ void AttentionCapture::free_buffer() {
 }
 
 // TokenWithAttention constructor implementations
-TokenWithAttention::TokenWithAttention(const std::string& text)
-    : token_text(text), has_attention(false) {}
+TokenWithAttention::TokenWithAttention(const std::string& text, int id)
+    : token_text(text), token_id(id), has_attention(false) {}
 
-TokenWithAttention::TokenWithAttention(const std::string& text, const AttentionCapture& attention_src)
-    : token_text(text) {
+TokenWithAttention::TokenWithAttention(const std::string& text, int id, const AttentionCapture& attention_src)
+    : token_text(text), token_id(id) {
     if (attention_src.buffer_used > 0) {
         // Copy attention data from static buffer BEFORE next token overwrites it
         attention_data.assign(
@@ -114,12 +114,12 @@ TokenWithAttention::TokenWithAttention(const std::string& text, const AttentionC
         n_heads = attention_src.n_heads;
         seq_len = attention_src.seq_len;
         has_attention = true;
-        fprintf(stderr, "DEBUG: Token '%s' paired with attention [%d, %d, %d]\n",
-                text.substr(0, 20).c_str(), n_layers, n_heads, seq_len);
+        fprintf(stderr, "DEBUG: Token ID=%d '%s' paired with attention [%d, %d, %d]\n",
+                id, text.substr(0, 20).c_str(), n_layers, n_heads, seq_len);
     } else {
         has_attention = false;
-        fprintf(stderr, "DEBUG: Token '%s' NO attention (buffer_used=%zu)\n",
-                text.substr(0, 20).c_str(), attention_src.buffer_used);
+        fprintf(stderr, "DEBUG: Token ID=%d '%s' NO attention (buffer_used=%zu)\n",
+                id, text.substr(0, 20).c_str(), attention_src.buffer_used);
     }
 }
 
@@ -4480,7 +4480,7 @@ generation_outputs gpttype_generate(const generation_inputs inputs)
                     }
 
                     // PUSH MODEL: Pair token + attention AT GENERATION (before antislop delay)
-                    delayed_generated_tokens.push_back(TokenWithAttention(tokenizedstr, g_attention));
+                    delayed_generated_tokens.push_back(TokenWithAttention(tokenizedstr, eid, g_attention));
 
                     while(delayed_generated_tokens.size() > delayed_generated_tokens_limit && delayed_generated_tokens.size() > 0)
                     {

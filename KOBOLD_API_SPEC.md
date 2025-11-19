@@ -225,18 +225,9 @@ Generate text with attention extraction (non-streaming, returns complete respons
 ```json
 {
   "generated_tokens": [
-    {
-      "token_id": 40,
-      "text": "I"
-    },
-    {
-      "token_id": 2846,
-      "text": "'m"
-    },
-    {
-      "token_id": 3291,
-      "text": " doing"
-    }
+    {"token_id": 40, "text": "I"},
+    {"token_id": 2846, "text": "'m"},
+    {"token_id": 3291, "text": " doing"}
   ],
   "generated_text": "I'm doing well, thank you for asking!",
   "finish_reason": "stop_token",
@@ -305,12 +296,7 @@ const ws = new WebSocket('ws://localhost:5001/api/v1/generate/stream');
   "request_id": "uuid-1234-5678",
   "token": {
     "token_id": 40,
-    "text": "I",
-    "logprob": -0.234,
-    "top_logprobs": [
-      {"token_id": 40, "text": "I", "logprob": -0.234},
-      {"token_id": 791, "text": "The", "logprob": -1.567}
-    ]
+    "text": "I"
   },
   "attention": {
     "format": "per_layer",
@@ -325,12 +311,21 @@ const ws = new WebSocket('ws://localhost:5001/api/v1/generate/stream');
 
 **Attention Data Structure** (after base64 decode):
 - **Shape**: `[num_layers, num_heads, context_length]`
-- **Interpretation**: Attention FROM the newly generated token TO all previous tokens
+- **Format**: **RAW PRE-SOFTMAX LOGITS** (not normalized attention weights)
+- **Interpretation**: Attention logits FROM the newly generated token TO all previous tokens
 - **Example**: For Qwen 7B (28 layers, 28 heads) with 267 tokens in context:
   - Shape: `[28, 28, 267]`
-  - `attention[layer][head][i]` = attention weight from new token to `input_ids[i]`
+  - `attention[layer][head][i]` = raw attention logit from new token to `input_ids[i]`
   - Client maintains mapping: `input_ids[i]` → conversation position ID
-  - Sum over last dimension (context) = 1.0 (attention is normalized)
+  - **Value range**: Typically `-100` to `+100` (raw logits before softmax)
+  - **Dynamic range**: ~200 (excellent for brightness scoring!)
+  - **NOT normalized**: Sum does NOT equal 1.0 - these are pre-softmax values
+
+**Why Raw Logits?**
+- **Better dynamic range**: Normalized attention compresses to [0, 1], losing information
+- **Natural decay**: Negative values may eliminate need for artificial decay in brightness tracking
+- **Preserve outliers**: Extreme values (very high/low attention) are not compressed by softmax
+- **Client choice**: Client can apply softmax if needed, but can't reverse it
 
 **Why this shape?**
 - Attention indexed by input array position, NOT conversation position IDs
@@ -385,33 +380,40 @@ const ws = new WebSocket('ws://localhost:5001/api/v1/generate/stream');
 - **FlatBuffers**: Zero-copy deserialization
 - **Raw binary WebSocket**: Maximum efficiency (not JSON)
 
-**Reference implementation** (Python server side):
+**Reference implementation** (Python server side with KoboldCPP C++ layer):
 ```python
 import numpy as np
 import base64
+import ctypes
 
-# Extract attention from model output
-# attention shape: (num_layers, num_heads, seq_len, seq_len)
-attention_to_all_tokens = attention[:, :, -1, :]  # From last token to all tokens
-# Shape: (num_layers, num_heads, seq_len)
+# Get attention from C++ extraction layer (raw pre-softmax logits)
+# C++ layer returns: g_attention.buffer with shape [n_layers, n_heads, seq_len]
+attention_output = handle.get_token_attention(token_idx)
 
-# Convert to float32 (bfloat16 not widely supported)
-attention_np = attention_to_all_tokens.cpu().numpy().astype(np.float32)
+if attention_output.valid:
+    # Convert C pointer to numpy array
+    attention_np = np.ctypeslib.as_array(
+        attention_output.data,
+        shape=(attention_output.n_layers, attention_output.n_heads, attention_output.seq_len)
+    )
+    # Shape: (num_layers, num_heads, seq_len)
+    # Values: Raw pre-softmax logits (NOT normalized!)
 
-# Encode as base64
-attention_bytes = attention_np.tobytes()
-attention_base64 = base64.b64encode(attention_bytes).decode('ascii')
+    # Already float32 from C++ layer
+    # Encode as base64
+    attention_bytes = attention_np.tobytes()
+    attention_base64 = base64.b64encode(attention_bytes).decode('ascii')
 
-# Send in JSON
-response = {
-    "attention": {
-        "format": "per_layer",
-        "shape": list(attention_np.shape),
-        "encoding": "base64",
-        "dtype": "float32",
-        "data": attention_base64
+    # Send in JSON
+    response = {
+        "attention": {
+            "format": "per_layer",
+            "shape": list(attention_np.shape),
+            "encoding": "base64",
+            "dtype": "float32",
+            "data": attention_base64
+        }
     }
-}
 ```
 
 **Client-side decode** (Python):
@@ -852,8 +854,8 @@ Examples:
 ### Validation Checklist
 
 - [ ] Attention tensor shape matches `(num_layers, num_heads, context_length)`
-- [ ] Sum of attention across context dimension ≈ 1.0 (normalized)
-- [ ] All attention values in `[0, 1]`
+- [ ] Attention values are raw pre-softmax logits (typically -100 to +100)
+- [ ] Sum across context dimension is NOT 1.0 (raw logits, not normalized)
 - [ ] Token positions map correctly to attention indices
 - [ ] Special tokens (BOS, EOS, im_start, im_end) handled correctly
 - [ ] Stop tokens terminate generation

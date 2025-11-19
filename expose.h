@@ -172,6 +172,7 @@ struct AttentionCapture {
 
 struct TokenWithAttention {
     std::string token_text;
+    int token_id = -1;  // NEW: Store the actual token ID from sampling
     std::vector<float> attention_data;
     int n_layers = 0;
     int n_heads = 0;
@@ -182,10 +183,10 @@ struct TokenWithAttention {
     TokenWithAttention() = default;
 
     // Constructor for tokens without attention
-    TokenWithAttention(const std::string& text);
+    TokenWithAttention(const std::string& text, int id = -1);
 
     // Constructor for tokens with attention (copies from AttentionCapture buffer)
-    TokenWithAttention(const std::string& text, const AttentionCapture& attention_src);
+    TokenWithAttention(const std::string& text, int id, const AttentionCapture& attention_src);
 };
 
 struct token_count_outputs

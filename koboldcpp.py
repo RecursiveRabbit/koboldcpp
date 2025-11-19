@@ -570,6 +570,8 @@ def init_library():
     handle.get_token_attention.restype = attention_outputs
     handle.new_token.restype = ctypes.c_char_p
     handle.new_token.argtypes = [ctypes.c_int]
+    handle.new_token_id.restype = ctypes.c_int
+    handle.new_token_id.argtypes = [ctypes.c_int]
     handle.get_stream_count.restype = ctypes.c_int
     handle.has_finished.restype = ctypes.c_bool
     handle.has_audio_support.restype = ctypes.c_bool
@@ -3090,6 +3092,7 @@ class KcppServerRequestHandler(http.server.SimpleHTTPRequestHandler):
         await asyncio.sleep(0.35) #anti race condition, prevent check from overtaking generate
 
         output_attentions = genparams.get('output_attentions', False)
+        request_id = genparams.get('request_id', None)  # Optional request ID for tracking
 
         try:
             tokenReserve = "" #keeps fully formed tokens that we cannot send out yet
@@ -3119,21 +3122,32 @@ class KcppServerRequestHandler(http.server.SimpleHTTPRequestHandler):
                         # If attention extraction is enabled, send individual token events
                         if output_attentions:
                             import numpy as np
+
+                            # Retrieve token ID from C++ layer
+                            tok_id = handle.new_token_id(token_idx)
+
+                            # Build complete token event with all metadata
                             token_event = {
                                 "type": "token",
                                 "token": {
-                                    "token_id": None,  # TODO: Add token ID retrieval
+                                    "token_id": tok_id if tok_id != -1 else None,
                                     "text": tokenSeg
                                 }
                             }
 
-                            # Retrieve attention for this token (push model - already captured)
+                            # Add request_id if provided
+                            if request_id:
+                                token_event["request_id"] = request_id
+
+                            # Retrieve attention for this token (push model - already captured by C++ layer)
                             attn = handle.get_token_attention(token_idx)
                             if attn.valid:
+                                # Convert C pointer to numpy array
                                 total_elements = attn.n_layers * attn.n_heads * attn.seq_len
                                 attention_array = np.ctypeslib.as_array(attn.data, shape=(total_elements,))
                                 attention_array = attention_array.reshape((attn.n_layers, attn.n_heads, attn.seq_len))
 
+                                # Encode as base64 for JSON transmission
                                 attention_bytes = attention_array.tobytes()
                                 attention_base64 = base64.b64encode(attention_bytes).decode('ascii')
 
@@ -3146,9 +3160,10 @@ class KcppServerRequestHandler(http.server.SimpleHTTPRequestHandler):
                                     "data": attention_base64
                                 }
                             else:
+                                # No attention data available for this token
                                 token_event["attention"] = None
 
-                            # Send token event immediately
+                            # Send token event immediately via SSE
                             event_str = json.dumps(token_event)
                             await self.send_kai_sse_event(event_str)
                         else:
@@ -3162,6 +3177,8 @@ class KcppServerRequestHandler(http.server.SimpleHTTPRequestHandler):
                         "finish_reason": currfinishreason,
                         "total_tokens": handle.get_stream_count()
                     }
+                    if request_id:
+                        done_event["request_id"] = request_id
                     event_str = json.dumps(done_event)
                     await self.send_kai_sse_event(event_str)
 

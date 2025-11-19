@@ -368,13 +368,15 @@ Generation N+1:
 
 ## Status
 
-**Last Updated**: 2025-11-18 (Session 5)
+**Last Updated**: 2025-11-18 (Session 6)
 
-**Implementation Status**: ✅ **UNCONDITIONAL EXTRACTION - PRODUCTION READY**
+**Implementation Status**: ✅ **PRODUCTION READY - COMPLETE TOKEN EVENT JSON**
 **Architecture**: Hooked at core `process_ubatch()` - unavoidable extraction for ALL tokens
 **Compilation**: ✅ SUCCESS (CUDA + CPU builds)
 **Extraction**: ✅ **UNCONDITIONAL** - Works for streaming and non-streaming
 **Data Format**: ✅ Raw pre-softmax logits with excellent dynamic range (-93 to +84)
+**Token IDs**: ✅ Exposed via C API `new_token_id()` and included in Token Event JSON
+**API**: ✅ `/api/extra/generate/stream` with complete Token + Attention events
 **Integration**: Ready for Halo Weave backend integration
 
 ---
@@ -732,6 +734,135 @@ koboldcpp_default.so - 11MB (CPU-only)
 - Antislop compatibility: `delayed_generated_tokens` changed from `deque<string>` to `deque<TokenWithAttention>`
 - `get_token_attention(idx)` API for retrieving pre-paired attention
 - Comprehensive documentation (CLAUDE.md + KOBOLD_API_SPEC.md)
+
+---
+
+### Session 6 (2025-11-18): Token ID Exposure + Phase 2 API Complete - ✅ **READY FOR HALO WEAVE**
+
+**Problem**: Token Event JSON didn't include token IDs - C++ layer generates token IDs but they weren't exposed through the API.
+
+**Solution**: Added token ID tracking and C API exposure.
+
+**Implementation**:
+
+1. **Added token_id field to TokenWithAttention** (`expose.h:175`):
+```cpp
+struct TokenWithAttention {
+    std::string token_text;
+    int token_id = -1;  // NEW: Store the actual token ID from sampling
+    std::vector<float> attention_data;
+    ...
+};
+```
+
+2. **Updated constructors** (`gpttype_adapter.cpp:102-124`) to accept and store token ID:
+```cpp
+TokenWithAttention::TokenWithAttention(const std::string& text, int id)
+    : token_text(text), token_id(id), has_attention(false) {}
+
+TokenWithAttention::TokenWithAttention(const std::string& text, int id, const AttentionCapture& attention_src)
+    : token_text(text), token_id(id) { ... }
+```
+
+3. **Updated token creation site** (`gpttype_adapter.cpp:4483`) to pass token ID:
+```cpp
+delayed_generated_tokens.push_back(TokenWithAttention(tokenizedstr, eid, g_attention));
+```
+
+4. **Added C API function** (`expose.cpp:298-302`):
+```cpp
+int new_token_id(int idx) {
+    if (generated_tokens.size() <= idx || idx < 0) return -1;
+    return generated_tokens[idx].token_id;
+}
+```
+
+5. **Added Python binding** (`koboldcpp.py:573-574`):
+```python
+handle.new_token_id.restype = ctypes.c_int
+handle.new_token_id.argtypes = [ctypes.c_int]
+```
+
+6. **Updated streaming endpoint** (`koboldcpp.py:3127-3135`):
+```python
+tok_id = handle.new_token_id(token_idx)
+token_event = {
+    "type": "token",
+    "token": {
+        "token_id": tok_id if tok_id != -1 else None,
+        "text": tokenSeg
+    }
+}
+```
+
+7. **Cleaned up API spec**: Removed logprobs (not needed for brightness scoring)
+
+**Test Results** (Qwen2.5-VL-7B-Instruct-Q8_0):
+```json
+{
+  "type": "token",
+  "token": {
+    "token_id": 13,
+    "text": "."
+  },
+  "request_id": "example-request-123",
+  "attention": {
+    "format": "per_layer",
+    "shape": [28, 28, 256],
+    "context_length": 256,
+    "encoding": "base64",
+    "dtype": "float32",
+    "data": "sNCcP7KRvj..." // 802KB raw logits
+  }
+}
+```
+
+**What Works Now**:
+- ✅ Complete Token Event JSON with token ID + text + raw logits
+- ✅ Streaming via `/api/extra/generate/stream`
+- ✅ Request ID tracking
+- ✅ ~800KB per token (acceptable for local inference)
+- ✅ Token ID matches the actual sampled token from C++ layer
+
+**Files Modified**:
+- `expose.h:175` - Added token_id field to TokenWithAttention
+- `expose.h:186-189` - Updated constructor signatures
+- `gpttype_adapter.cpp:102-124` - Updated constructor implementations
+- `gpttype_adapter.cpp:4483` - Pass token ID when creating TokenWithAttention
+- `expose.cpp:298-302` - Added new_token_id() C API function
+- `koboldcpp.py:573-574` - Added Python binding for new_token_id
+- `koboldcpp.py:3127-3135` - Retrieve and include token ID in Token Event JSON
+- `KOBOLD_API_SPEC.md` - Removed logprobs, updated examples
+
+**Production Ready Checklist**:
+- [x] Token IDs exposed via C API
+- [x] Token IDs included in Token Event JSON
+- [x] Raw pre-softmax logits (not normalized)
+- [x] Streaming endpoint works
+- [x] Request ID tracking
+- [x] Complete JSON format matching spec
+- [x] Compiled successfully (CUDA + CPU)
+- [x] Tested with 7B model
+- [ ] Test with antislop enabled
+- [ ] Integrate with Halo Weave backend
+
+**The Vision Realized - Complete**:
+
+You now have the exact Token Event JSON you requested:
+```json
+{
+  "type": "token",
+  "token": {"token_id": 13, "text": "."},
+  "request_id": "...",
+  "attention": {
+    "format": "per_layer",
+    "shape": [28, 28, 256],
+    "data": "..." // 802KB base64-encoded raw logits
+  }
+}
+```
+
+Every generated token includes its ID, text, and 800KB of raw attention logits. Ready for Halo Weave integration!
 
 ---
 
