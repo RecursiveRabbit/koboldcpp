@@ -409,6 +409,20 @@ class embeddings_generation_outputs(ctypes.Structure):
                 ("count", ctypes.c_int),
                 ("data", ctypes.c_char_p)]
 
+class model_info_outputs(ctypes.Structure):
+    _fields_ = [("vocab_size", ctypes.c_int),
+                ("num_layers", ctypes.c_int),
+                ("num_attention_heads", ctypes.c_int),
+                ("num_key_value_heads", ctypes.c_int),
+                ("embedding_size", ctypes.c_int),
+                ("max_context_length", ctypes.c_int),
+                ("max_trained_context", ctypes.c_int),
+                ("bos_token_id", ctypes.c_int),
+                ("eos_token_id", ctypes.c_int),
+                ("eot_token_id", ctypes.c_int),
+                ("rope_freq_base", ctypes.c_float),
+                ("rope_freq_scale", ctypes.c_float)]
+
 
 
 def getdirpath():
@@ -592,6 +606,7 @@ def init_library():
     handle.token_count.restype = token_count_outputs
     handle.get_pending_output.restype = ctypes.c_char_p
     handle.get_chat_template.restype = ctypes.c_char_p
+    handle.get_model_info.restype = model_info_outputs
     handle.calc_new_state_kv.restype = ctypes.c_size_t
     handle.calc_new_state_tokencount.restype = ctypes.c_size_t
     handle.calc_old_state_kv.argtypes = [ctypes.c_int]
@@ -3508,7 +3523,31 @@ Change Mode<br>
 
         elif self.path.endswith(('/api/v1/model', '/api/latest/model')):
             auth_ok = self.check_header_password(password)
-            response_body = (json.dumps({'result': (friendlymodelname if auth_ok else "koboldcpp/protected-model") }).encode())
+
+            # Get detailed model information
+            try:
+                info = handle.get_model_info()
+                response_data = {
+                    'result': (friendlymodelname if auth_ok else "koboldcpp/protected-model"),
+                    'model_name': (friendlymodelname if auth_ok else "koboldcpp/protected-model"),
+                    'vocab_size': info.vocab_size,
+                    'num_layers': info.num_layers,
+                    'num_attention_heads': info.num_attention_heads,
+                    'num_key_value_heads': info.num_key_value_heads,
+                    'embedding_size': info.embedding_size,
+                    'max_context_length': info.max_context_length,
+                    'max_trained_context': info.max_trained_context,
+                    'bos_token_id': info.bos_token_id,
+                    'eos_token_id': info.eos_token_id,
+                    'eot_token_id': info.eot_token_id,
+                    'rope_freq_base': info.rope_freq_base,
+                    'rope_freq_scale': info.rope_freq_scale
+                }
+            except Exception as e:
+                # Fallback to basic info if model info retrieval fails
+                response_data = {'result': (friendlymodelname if auth_ok else "koboldcpp/protected-model")}
+
+            response_body = (json.dumps(response_data).encode())
 
         elif self.path.endswith(('/api/v1/config/max_length', '/api/latest/config/max_length')):
             response_body = (json.dumps({"value": maxhordelen}).encode())

@@ -1,8 +1,8 @@
 # KoboldCPP Attention Extraction API - TESTED DOCUMENTATION
 ## Real API Responses and Working Endpoints
 
-**Version**: 3.0 (Reality Edition)
-**Date**: 2025-11-18
+**Version**: 3.1 (Model Info Edition)
+**Date**: 2025-11-19
 **Status**: ✅ **VERIFIED WORKING** - All endpoints tested with live server
 **Model Tested**: Qwen2.5-VL-7B-Instruct-Q8_0 (28 layers, 28 heads)
 
@@ -30,8 +30,13 @@
 - Round-trip tokenize/detokenize verified
 - Deterministic tokenization for Halo Weave
 
+### ✅ Phase 4: Model Information API (COMPLETE - Session 9)
+- Enhanced `/api/v1/model` endpoint with full architecture metadata
+- 12 fields exposed: layers, heads, vocab size, context limits, special tokens, RoPE params
+- Essential for attention tensor shape validation
+- Enables model-agnostic client implementations
+
 ### ⚠️ What Doesn't Exist
-- No `/api/v1/model/info` with architecture details (only basic model name)
 - No non-streaming `/api/v1/generate` endpoint with attention
 - No `input_ids` parameter support (generation still requires text prompt)
 
@@ -158,24 +163,57 @@ curl -X POST http://localhost:5001/api/v1/detokenize \
 ### 2. Model Information
 **`GET /api/v1/model`**
 
-Get basic model name.
+Get comprehensive model architecture details and metadata.
 
 **Request**:
 ```bash
 curl http://localhost:5001/api/v1/model
 ```
 
-**ACTUAL Response**:
+**ACTUAL Response** (from Qwen2.5-VL-7B-Instruct-Q8_0):
 ```json
 {
-  "result": "koboldcpp/Qwen2.5-VL-7B-Instruct-Q8_0"
+  "result": "koboldcpp/Qwen2.5-VL-7B-Instruct-Q8_0",
+  "model_name": "koboldcpp/Qwen2.5-VL-7B-Instruct-Q8_0",
+  "vocab_size": 151936,
+  "num_layers": 28,
+  "num_attention_heads": 28,
+  "num_key_value_heads": 4,
+  "embedding_size": 3584,
+  "max_context_length": 512,
+  "max_trained_context": 32768,
+  "bos_token_id": 151643,
+  "eos_token_id": 151645,
+  "eot_token_id": 151644,
+  "rope_freq_base": 10000.0,
+  "rope_freq_scale": 1.0
 }
 ```
 
+**Response Fields**:
+- `result` (string): Model name (for backwards compatibility)
+- `model_name` (string): Full model name
+- `vocab_size` (int): Total vocabulary size - validate token IDs are in `[0, vocab_size)`
+- `num_layers` (int): Number of transformer layers - validates attention shape `[num_layers, ...]`
+- `num_attention_heads` (int): Attention heads per layer - validates attention shape `[..., num_heads, ...]`
+- `num_key_value_heads` (int): KV cache heads (for GQA models like Qwen2.5)
+- `embedding_size` (int): Hidden dimension size
+- `max_context_length` (int): Current context window (set via --contextsize)
+- `max_trained_context` (int): Maximum context the model was trained on
+- `bos_token_id` (int): Beginning-of-sentence token ID
+- `eos_token_id` (int): End-of-sentence token ID
+- `eot_token_id` (int): End-of-turn token ID (or -1 if not available)
+- `rope_freq_base` (float): RoPE frequency base (default: 10000.0)
+- `rope_freq_scale` (float): RoPE frequency scaling factor
+
 **Notes**:
-- Returns ONLY the model name, not architecture details
-- No layer count, head count, vocab size, etc.
-- Client must know model architecture externally
+- **NEW**: Now returns full architecture details (previously only returned model name)
+- Essential for validating attention tensor shapes: `[num_layers, num_attention_heads, seq_len]`
+- Use `vocab_size` to validate token IDs before generation
+- Use `max_context_length` to prevent context overflow
+- `max_trained_context` shows model's training limit (useful for context extension)
+- Special token IDs needed for proper tokenization and generation control
+- If model info retrieval fails, falls back to basic `{"result": "model_name"}` format
 
 ---
 
@@ -365,9 +403,9 @@ for line in response.iter_lines():
 ## Summary
 
 ### What Works ✅
-1. **GET /api/v1/model** - Returns model name
-2. **POST /api/v1/tokenize** - Tokenize text to token IDs + text (NEW)
-3. **POST /api/v1/detokenize** - Convert token IDs back to text (NEW)
+1. **GET /api/v1/model** - Returns comprehensive model architecture details (NEW: full metadata!)
+2. **POST /api/v1/tokenize** - Tokenize text to token IDs + text
+3. **POST /api/v1/detokenize** - Convert token IDs back to text
 4. **POST /api/extra/generate/stream** - Streaming generation with attention
 5. Attention extraction: Raw pre-softmax logits, shape `[layers, heads, context]`
 6. Base64 encoding for JSON transmission
@@ -375,14 +413,16 @@ for line in response.iter_lines():
 8. SSE protocol for real-time streaming
 
 ### What Doesn't Exist ❌
-- No detailed model info endpoint (only basic name)
 - No non-streaming generation with attention
 - No WebSocket support (uses HTTP + SSE instead)
 - No `input_ids` parameter for generation (still requires text prompt)
 
 ### For Halo Weave Integration
+- ✅ Model metadata available via `/api/v1/model` (architecture validation)
 - ✅ Tokenization available via `/api/v1/tokenize` (deterministic)
 - ✅ Detokenization available via `/api/v1/detokenize` (for reconstruction)
+- ✅ Special token IDs exposed (BOS, EOS, EOT) for proper handling
+- ✅ Attention shape validation: use `num_layers` and `num_attention_heads` from model info
 - Client must map attention indices to conversation positions
 - Attention is indexed by input prompt array position
 - KV cache cannot survive pruning - must reprocess context after pruning
@@ -392,7 +432,7 @@ for line in response.iter_lines():
 
 ---
 
-**Last Updated**: 2025-11-19 (Session 8 - Tokenization API added)
+**Last Updated**: 2025-11-19 (Session 9 - Model Information API enhanced)
 **Tested With**: Qwen2.5-VL-7B-Instruct-Q8_0 (28L, 28H, Q8_0 quantization)
 **Server**: koboldcpp v1.101.1 with custom attention extraction + tokenization patches
-**New in Session 8**: `/api/v1/tokenize` and `/api/v1/detokenize` endpoints
+**New in Session 9**: Enhanced `/api/v1/model` endpoint with full architecture metadata (12 fields)

@@ -104,6 +104,7 @@ const std::string & gpttype_get_pending_output();
 std::vector<int> gpttype_get_token_arr(const std::string & input, bool addbos);
 std::string gpttype_detokenize(const std::vector<int> & input, bool render_special);
 std::string gpttype_token_to_str(int token_id, bool render_special);
+model_info_outputs gpttype_get_model_info();
 const std::vector<TopPicksData> gpttype_get_top_picks_data();
 
 bool sdtype_load_model(const sd_load_model_inputs inputs);

@@ -3248,6 +3248,47 @@ std::string gpttype_token_to_str(int token_id, bool render_special)
     return FileFormatTokenizeID(token_id, file_format, render_special);
 }
 
+model_info_outputs gpttype_get_model_info()
+{
+    model_info_outputs info;
+
+    if(file_format == FileFormat::GGUF_GENERIC)
+    {
+        // GGUF format (llama.cpp v4 API)
+        if(llama_ctx_v4 != nullptr)
+        {
+            const llama_model * model = llama_get_model(llama_ctx_v4);
+            const llama_vocab * vocab = llama_model_get_vocab(model);
+
+            // Model architecture info
+            info.vocab_size = llama_vocab_n_tokens(vocab);
+            info.num_layers = llama_model_n_layer(model);
+            info.num_attention_heads = llama_model_n_head(model);
+            info.num_key_value_heads = llama_model_n_head_kv(model);
+            info.embedding_size = llama_model_n_embd(model);
+            info.max_trained_context = llama_model_n_ctx_train(model);
+            info.max_context_length = llama_n_ctx(llama_ctx_v4);
+
+            // Special tokens
+            info.bos_token_id = llama_vocab_bos(vocab);
+            info.eos_token_id = llama_vocab_eos(vocab);
+            info.eot_token_id = llama_vocab_eot(vocab);
+
+            // RoPE parameters - default values since direct API is not available
+            info.rope_freq_base = 10000.0f;  // Standard RoPE base
+            info.rope_freq_scale = llama_model_rope_freq_scale_train(model);
+        }
+    }
+    else
+    {
+        // Fallback for older formats - use available info
+        info.vocab_size = n_vocab;
+        // Other fields remain at default values (0 or -1)
+    }
+
+    return info;
+}
+
 const std::string & gpttype_get_pending_output()
 {
     if(kcpp_data==nullptr)

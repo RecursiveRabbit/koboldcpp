@@ -457,4 +457,8 @@ extern "C"
     {
         return gpttype_clear_state_kv(true);
     }
+    model_info_outputs get_model_info()
+    {
+        return gpttype_get_model_info();
+    }
 }

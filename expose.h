@@ -346,6 +346,22 @@ struct embeddings_generation_outputs
     const char * data = "";
 };
 
+struct model_info_outputs
+{
+    int vocab_size = 0;
+    int num_layers = 0;
+    int num_attention_heads = 0;
+    int num_key_value_heads = 0;
+    int embedding_size = 0;
+    int max_context_length = 0;
+    int max_trained_context = 0;
+    int bos_token_id = -1;
+    int eos_token_id = -1;
+    int eot_token_id = -1;
+    float rope_freq_base = 0.0f;
+    float rope_freq_scale = 1.0f;
+};
+
 extern std::string executable_path;
 extern std::string lora_filename;
 extern std::string mmproj_filename;
