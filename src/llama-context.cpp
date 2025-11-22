@@ -795,7 +795,12 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         return nullptr;
     }
 
-    // UNCONDITIONAL ATTENTION EXTRACTION HOOK
+    // Synchronize backend scheduler to ensure all GPU kernels complete
+    // CRITICAL: Fixes race condition where attention tensors are read before GPU writes them
+    // Without this, ~50% of attention data is corrupted (contains stale logits instead of softmax)
+    ggml_backend_sched_synchronize(sched.get());
+
+    // UNCONDITIONAL ATTENTION EXTRACTION HOOK (after GPU sync)
     // Called after every graph compute - cannot be bypassed
     extern void extract_pending_attention_data();
     extract_pending_attention_data();
