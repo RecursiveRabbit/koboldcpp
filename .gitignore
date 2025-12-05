@@ -149,3 +149,4 @@ conda/
 
 # Jetbrains idea folder
 .idea/
+venv/
