@@ -73,8 +73,6 @@ void AttentionCapture::reset() {
 
 void AttentionCapture::append_layer(const float* data, int heads, int len) {
     size_t count = (size_t)heads * len;
-    fprintf(stderr, "DEBUG append_layer: heads=%d, len=%d, count=%zu, buffer_used=%zu, capacity=%zu\n",
-            heads, len, count, buffer_used, buffer_capacity);
     if (buffer_used + count > buffer_capacity) {
         fprintf(stderr, "WARNING: Attention buffer overflow (used %zu, capacity %zu)\n",
                 buffer_used + count, buffer_capacity);
@@ -85,8 +83,6 @@ void AttentionCapture::append_layer(const float* data, int heads, int len) {
     n_layers_captured++;
     if (n_heads == 0) n_heads = heads;  // Set once
     if (seq_len == 0) seq_len = len;    // Set once
-    fprintf(stderr, "DEBUG append_layer DONE: buffer_used=%zu, n_layers_captured=%d\n",
-            buffer_used, n_layers_captured);
 }
 
 void AttentionCapture::free_buffer() {
@@ -114,12 +110,8 @@ TokenWithAttention::TokenWithAttention(const std::string& text, int id, const At
         n_heads = attention_src.n_heads;
         seq_len = attention_src.seq_len;
         has_attention = true;
-        fprintf(stderr, "DEBUG: Token ID=%d '%s' paired with attention [%d, %d, %d]\n",
-                id, text.substr(0, 20).c_str(), n_layers, n_heads, seq_len);
     } else {
         has_attention = false;
-        fprintf(stderr, "DEBUG: Token ID=%d '%s' NO attention (buffer_used=%zu)\n",
-                id, text.substr(0, 20).c_str(), attention_src.buffer_used);
     }
 }
 
@@ -278,8 +270,6 @@ void extract_pending_attention_data() {
 
     // Reset buffer state for this token (don't accumulate across tokens)
     g_attention.reset();
-
-    fprintf(stderr, "DEBUG: Extracting attention from %zu pending tensors\n", g_pending_attentions.size());
 
     for (const auto & pending : g_pending_attentions) {
         ggml_tensor * cur = pending.tensor;

@@ -1,0 +1,18 @@
+diff --git a/src/llama-context.cpp b/src/llama-context.cpp
+index original..fixed 100644
+--- a/src/llama-context.cpp
++++ b/src/llama-context.cpp
+@@ -795,7 +795,12 @@ llama_graph_plan * llama_context::graph_schedule(
+         return nullptr;
+     }
+
+-    // UNCONDITIONAL ATTENTION EXTRACTION HOOK
++    // Synchronize backend scheduler to ensure all GPU kernels complete
++    // CRITICAL: Fixes race condition where attention tensors are read before GPU writes them
++    // Without this, ~50% of attention data is corrupted (contains stale logits instead of softmax)
++    ggml_backend_sched_synchronize(sched.get());
++
++    // UNCONDITIONAL ATTENTION EXTRACTION HOOK (after GPU sync)
+     // Called after every graph compute - cannot be bypassed
+     extern void extract_pending_attention_data();
+     extract_pending_attention_data();

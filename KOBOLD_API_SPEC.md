@@ -42,11 +42,12 @@
 - Enables deterministic token control for context pruning
 - Works with both streaming and non-streaming endpoints
 
-### ✅ Phase 6: WebSocket Binary Streaming (COMPLETE - Session 11)
+### ✅ Phase 6: WebSocket Binary Streaming (COMPLETE - Session 11, Updated Session 12)
 - WebSocket endpoint `/api/extra/generate/stream/ws`
-- Binary frames for attention data (no base64 encoding)
+- Binary frames for **pre-aggregated** attention data (Session 12)
+- Server computes `mean(axis=(0,1))` - 784x bandwidth reduction
 - Text frames for token metadata (tiny JSON)
-- ~99% reduction in serialization overhead
+- Real-time performance: 47.8 tok/s (matches model inference speed)
 - Zero-copy on client side with `new Float32Array()`
 - ✅ TESTED AND WORKING
 
@@ -356,10 +357,10 @@ data: {json}
 
 ---
 
-### 3. WebSocket Binary Streaming (NEW - Session 11)
+### 3. WebSocket Binary Streaming (Session 11, Updated Session 12)
 **`ws://localhost:5001/api/extra/generate/stream/ws`**
 
-High-performance WebSocket endpoint that sends attention data as raw binary frames instead of base64-encoded JSON. Eliminates ~64 seconds of serialization overhead for 512 tokens.
+High-performance WebSocket endpoint that sends **pre-aggregated** attention data as raw binary frames. Server computes `mean(axis=(0,1))` to reduce bandwidth by 784x.
 
 **Protocol**: WebSocket with alternating text/binary frames
 
@@ -389,13 +390,15 @@ const ws = new WebSocket('ws://localhost:5001/api/extra/generate/stream/ws');
 }
 ```
 
-**Frame 2: Binary** - Raw attention tensor:
+**Frame 2: Binary** - Pre-aggregated attention (Session 12 change):
 ```
-[float32 × num_layers × num_heads × context_length]
+[float32 × context_length]  // ~8KB instead of ~6.5MB
 ```
+- Server computes `mean(axis=(0,1))` across layers and heads
+- 784x bandwidth reduction (28×28 = 784)
 - No base64 encoding
-- No JSON wrapping
 - Direct `new Float32Array(event.data)` on client
+- Client should set `preAggregated: true` flag to skip client-side aggregation
 
 **Final Frame: Text** - Completion:
 ```json
@@ -431,35 +434,30 @@ ws.onmessage = (event) => {
             console.log('Generation complete:', data.total_tokens, 'tokens');
         }
     } else {
-        // Binary frame - raw float32 attention data
+        // Binary frame - pre-aggregated float32 attention data (Session 12)
         const attention = new Float32Array(event.data);  // Zero-copy!
-        const contextLen = attention.length / (num_layers * num_attention_heads);
-        console.log('Token:', pendingToken.text, 'Attention shape:', 
-                    [num_layers, num_attention_heads, contextLen]);
+        const contextLen = attention.length;  // Already aggregated, no division needed
+        console.log('Token:', pendingToken.text, 'Attention shape:', [contextLen]);
+        // attention[i] = mean attention to token i across all layers and heads
         pendingToken = null;
     }
 };
 ```
 
-**Performance Comparison**:
-| Metric | SSE + Base64 | WebSocket Binary |
-|--------|--------------|------------------|
-| Data per token | ~9MB (base64) | ~6.9MB (raw) |
-| Buffer accumulation | 37.6s | 0s |
-| JSON parsing | 5.5s | 0.1s |
-| Base64 decode | 21.0s | 0s |
-| **Total overhead** | **64s** | **<1s** |
+**Performance Comparison (Session 12 - with server-side aggregation)**:
+| Metric | SSE + Base64 | WebSocket (raw) | WebSocket (aggregated) |
+|--------|--------------|-----------------|------------------------|
+| Data per token | ~9MB | ~6.5MB | **~8KB** |
+| sendall time | N/A | 90ms/tok | **0.02ms/tok** |
+| Wall clock (443 tok) | ~80s | ~45s | **~9s** |
+| Tokens/sec | ~6 | ~10 | **~48** |
 
-**Tested Output** (Session 11):
+**Key insight**: Server-side aggregation (`mean(axis=(0,1))`) reduces data by 784x, eliminating TCP buffer blocking and achieving real-time performance matching model inference speed.
+
+**Tested Output** (Session 12):
 ```
-Token 1: id=12095 text=' Paris'
-  Attention: (none)
-Token 2: id=13 text='.'
-  Attention: 802816 bytes, 200704 floats, range=[0.00, 1.00]
-...
-Total attention data: 6.12 MB
-Elapsed time: 0.40s
-Tokens/sec: 22.4
+🚀 WebSocket: 443 tokens in 9.3s (47.8 tok/s)
+📦 Binary data: 3.6MB total (0.01MB/msg)
 ```
 
 ---
@@ -631,7 +629,7 @@ response = requests.post("http://localhost:5001/api/extra/generate/stream",
 
 ---
 
-**Last Updated**: 2025-12-05 (Session 11 - WebSocket Binary Streaming)
+**Last Updated**: 2025-12-05 (Session 12 - Server-Side Aggregation)
 **Tested With**: Qwen2.5-VL-7B-Instruct-Q8_0 (28L, 28H, Q8_0 quantization)
-**Server**: koboldcpp v1.101.1 with custom attention extraction + tokenization + input_ids + WebSocket patches
-**New in Session 11**: WebSocket endpoint `/api/extra/generate/stream/ws` for binary attention streaming (TESTED & WORKING)
+**Server**: koboldcpp v1.101.1 with custom attention extraction + tokenization + input_ids + WebSocket + aggregation patches
+**New in Session 12**: Server-side attention aggregation - 784x bandwidth reduction, real-time performance (47.8 tok/s)

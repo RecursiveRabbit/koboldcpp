@@ -3125,7 +3125,9 @@ class KcppServerRequestHandler(http.server.SimpleHTTPRequestHandler):
             header = struct.pack("!BBH", opcode, 126, length)
         else:
             header = struct.pack("!BBQ", opcode, 127, length)
-        self.connection.sendall(header + payload)
+        # Send header and payload separately to avoid copying large payloads
+        self.connection.sendall(header)
+        self.connection.sendall(payload)
 
     def ws_recv_frame(self):
         """Receive a WebSocket frame, returns (opcode, payload)"""
@@ -3171,7 +3173,11 @@ class KcppServerRequestHandler(http.server.SimpleHTTPRequestHandler):
         self._ws_send_frame(0x88, close_payload)
 
     async def handle_websocket_stream(self, genparams):
-        """Handle WebSocket streaming with binary attention frames"""
+        """Handle WebSocket streaming with binary attention frames.
+        
+        Attention data is aggregated server-side (mean across layers and heads)
+        to reduce bandwidth from ~6.5MB/token to ~8KB/token.
+        """
         global currfinishreason
         import numpy as np
 
@@ -3223,11 +3229,18 @@ class KcppServerRequestHandler(http.server.SimpleHTTPRequestHandler):
 
                         # Get attention data and send as binary frame
                         attn = handle.get_token_attention(token_idx)
+                        
                         if attn.valid:
-                            total_elements = attn.n_layers * attn.n_heads * attn.seq_len
-                            attention_array = np.ctypeslib.as_array(attn.data, shape=(total_elements,))
-                            # Send raw bytes directly - no base64, no JSON
-                            self.ws_send_binary_frame(attention_array.tobytes())
+                            # Aggregate attention server-side: mean across layers and heads
+                            # This reduces data from [layers, heads, seq_len] to [seq_len]
+                            # ~784x reduction (28*28 = 784)
+                            attention_array = np.ctypeslib.as_array(
+                                attn.data, 
+                                shape=(attn.n_layers, attn.n_heads, attn.seq_len)
+                            )
+                            # Mean across layers and heads -> shape [seq_len]
+                            aggregated = attention_array.mean(axis=(0, 1)).astype(np.float32)
+                            self.ws_send_binary_frame(aggregated.tobytes())
                         else:
                             # Send empty binary frame to indicate no attention
                             self.ws_send_binary_frame(b'')
@@ -3915,6 +3928,11 @@ Change Mode<br>
             self.send_header('Connection', 'Upgrade')
             self.send_header('Sec-WebSocket-Accept', ws_accept)
             self.end_headers()
+            
+            # Increase socket send buffer for large attention data (64MB)
+            # This prevents sendall() from blocking when client is slow to read
+            import socket
+            self.connection.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 64 * 1024 * 1024)
 
             try:
                 # Wait for client to send generation config as first text frame
