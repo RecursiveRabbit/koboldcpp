@@ -3104,6 +3104,161 @@ class KcppServerRequestHandler(http.server.SimpleHTTPRequestHandler):
         self.wfile.write(f'data: {data}\n\n'.encode())
         self.wfile.flush()
 
+    def ws_send_text_frame(self, data):
+        """Send a WebSocket text frame (opcode 0x81)"""
+        if isinstance(data, str):
+            payload = data.encode('utf-8')
+        else:
+            payload = data
+        self._ws_send_frame(0x81, payload)
+
+    def ws_send_binary_frame(self, data):
+        """Send a WebSocket binary frame (opcode 0x82)"""
+        self._ws_send_frame(0x82, data)
+
+    def _ws_send_frame(self, opcode, payload):
+        """Send a WebSocket frame with proper length encoding for large payloads"""
+        length = len(payload)
+        if length <= 125:
+            header = struct.pack("!BB", opcode, length)
+        elif length <= 65535:
+            header = struct.pack("!BBH", opcode, 126, length)
+        else:
+            header = struct.pack("!BBQ", opcode, 127, length)
+        self.connection.sendall(header + payload)
+
+    def ws_recv_frame(self):
+        """Receive a WebSocket frame, returns (opcode, payload)"""
+        # Read first 2 bytes
+        header = self.connection.recv(2)
+        if len(header) < 2:
+            return None, None
+        
+        opcode = header[0] & 0x0F
+        masked = (header[1] & 0x80) != 0
+        length = header[1] & 0x7F
+        
+        # Extended length
+        if length == 126:
+            ext = self.connection.recv(2)
+            length = struct.unpack("!H", ext)[0]
+        elif length == 127:
+            ext = self.connection.recv(8)
+            length = struct.unpack("!Q", ext)[0]
+        
+        # Masking key (client frames are always masked)
+        mask = None
+        if masked:
+            mask = self.connection.recv(4)
+        
+        # Payload
+        payload = b''
+        while len(payload) < length:
+            chunk = self.connection.recv(min(length - len(payload), 65536))
+            if not chunk:
+                break
+            payload += chunk
+        
+        # Unmask if needed
+        if mask:
+            payload = bytes(b ^ mask[i % 4] for i, b in enumerate(payload))
+        
+        return opcode, payload
+
+    def ws_send_close(self, code=1000):
+        """Send WebSocket close frame"""
+        close_payload = struct.pack("!H", code)
+        self._ws_send_frame(0x88, close_payload)
+
+    async def handle_websocket_stream(self, genparams):
+        """Handle WebSocket streaming with binary attention frames"""
+        global currfinishreason
+        import numpy as np
+
+        current_token = 0
+        incomplete_token_buffer = bytearray()
+        async_sleep_short = 0.02
+        await asyncio.sleep(0.35)  # anti race condition
+
+        request_id = genparams.get('request_id', None)
+
+        try:
+            while True:
+                streamDone = handle.has_finished()
+                if streamDone:
+                    sr = handle.get_last_stop_reason()
+                    currfinishreason = ("length" if (sr != 1) else "stop")
+
+                streamcount = handle.get_stream_count()
+                while current_token < streamcount:
+                    token = handle.new_token(current_token)
+                    if token is None:
+                        break
+
+                    token_idx = current_token
+                    current_token += 1
+                    newbyte = ctypes.string_at(token)
+                    incomplete_token_buffer += bytearray(newbyte)
+                    tokenSeg = incomplete_token_buffer.decode("UTF-8", "ignore")
+                    incseq = is_incomplete_utf8_sequence(incomplete_token_buffer)
+                    badFragment = (tokenSeg == " " and len(incomplete_token_buffer) > 1) or incseq
+
+                    if tokenSeg != "" and not badFragment:
+                        incomplete_token_buffer.clear()
+
+                        # Get token ID
+                        tok_id = handle.new_token_id(token_idx)
+
+                        # Build token metadata JSON (small, ~50 bytes)
+                        token_event = {
+                            "type": "token",
+                            "token_id": tok_id if tok_id != -1 else None,
+                            "text": tokenSeg
+                        }
+                        if request_id:
+                            token_event["request_id"] = request_id
+
+                        # Send token metadata as text frame
+                        self.ws_send_text_frame(json.dumps(token_event))
+
+                        # Get attention data and send as binary frame
+                        attn = handle.get_token_attention(token_idx)
+                        if attn.valid:
+                            total_elements = attn.n_layers * attn.n_heads * attn.seq_len
+                            attention_array = np.ctypeslib.as_array(attn.data, shape=(total_elements,))
+                            # Send raw bytes directly - no base64, no JSON
+                            self.ws_send_binary_frame(attention_array.tobytes())
+                        else:
+                            # Send empty binary frame to indicate no attention
+                            self.ws_send_binary_frame(b'')
+
+                if streamDone:
+                    # Send done event
+                    done_event = {
+                        "type": "done",
+                        "finish_reason": currfinishreason,
+                        "total_tokens": handle.get_stream_count()
+                    }
+                    if request_id:
+                        done_event["request_id"] = request_id
+                    self.ws_send_text_frame(json.dumps(done_event))
+                    break
+
+                await asyncio.sleep(async_sleep_short)
+
+        except Exception as ex:
+            print("WebSocket streaming was interrupted or aborted!")
+            print(ex)
+            handle.abort_generate()
+            time.sleep(0.2)
+
+        # Send close frame
+        try:
+            self.ws_send_close(1000)
+        except Exception:
+            pass
+        self.connection.close()
+
     async def handle_sse_stream(self, genparams, api_format):
         global friendlymodelname, currfinishreason
         # if tools, do not send anything - OAI tool calls will be handled with fakestreaming!
@@ -3748,6 +3903,46 @@ Change Mode<br>
             except Exception as e:
                 print(f"WebSocket send error: {e}")
             self.connection.close()
+            return
+        elif self.path.startswith('/api/extra/generate/stream/ws') and ('Upgrade' in self.headers and self.headers['Upgrade'].lower() == 'websocket' and
+            'Sec-WebSocket-Key' in self.headers):
+            # Binary attention streaming WebSocket endpoint
+            ws_key = self.headers['Sec-WebSocket-Key']
+            ws_accept = base64.b64encode(hashlib.sha1((ws_key + '258EAFA5-E914-47DA-95CA-C5AB0DC85B11').encode()).digest()).decode()
+            self.protocol_version = "HTTP/1.1"
+            self.send_response(101)
+            self.send_header('Upgrade', 'websocket')
+            self.send_header('Connection', 'Upgrade')
+            self.send_header('Sec-WebSocket-Accept', ws_accept)
+            self.end_headers()
+
+            try:
+                # Wait for client to send generation config as first text frame
+                opcode, payload = self.ws_recv_frame()
+                if opcode != 1:  # Not a text frame
+                    print("WebSocket: Expected text frame with generation config")
+                    self.ws_send_close(1002)  # Protocol error
+                    self.connection.close()
+                    return
+
+                genparams = json.loads(payload.decode('utf-8'))
+                genparams = transform_genparams(genparams, 2)  # api_format=2 for extra endpoint
+
+                # Run generation with WebSocket streaming
+                async def run_ws_generation():
+                    generate_task = asyncio.create_task(self.generate_text(genparams, 2, True))
+                    ws_task = asyncio.create_task(self.handle_websocket_stream(genparams))
+                    await asyncio.gather(generate_task, ws_task)
+
+                asyncio.run(run_ws_generation())
+
+            except Exception as e:
+                print(f"WebSocket generation error: {e}")
+                try:
+                    self.ws_send_close(1011)  # Internal error
+                except Exception:
+                    pass
+                self.connection.close()
             return
         elif self.path.endswith(('/.well-known/serviceinfo')):
             response_body = (json.dumps({"version":"0.2","software":{"name":"KoboldCpp","version":KcppVersion,"repository":"https://github.com/LostRuins/koboldcpp","homepage":"https://github.com/LostRuins/koboldcpp","logo":"https://raw.githubusercontent.com/LostRuins/koboldcpp/refs/heads/concedo/niko.ico"},"api":{"koboldai":{"name":"KoboldAI API","rel_url":"/api","documentation":"https://lite.koboldai.net/koboldcpp_api","version":KcppVersion},"openai":{"name":"OpenAI API","rel_url ":"/v1","documentation":"https://openai.com/documentation/api","version":KcppVersion}}}).encode())

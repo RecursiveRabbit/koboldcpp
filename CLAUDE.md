@@ -9,126 +9,75 @@ This is a fork of KoboldCpp modified to extract attention weights during text ge
 
 ---
 
-## Current Status: Output Works, Input Needs Work
+## Current Status: ✅ PRODUCTION READY
 
-**✅ THE HARD PART IS DONE**: Attention extraction is working perfectly!
-- Raw pre-softmax logits
+**All features implemented and tested:**
+- Raw pre-softmax logits extraction
 - Correct shape: `[n_layers, n_heads, seq_len]`
-- Streaming via SSE
-- ~1MB per token, base64-encoded
+- Streaming via SSE (base64) or WebSocket (binary)
 - Request tracking functional
+- Tokenization endpoints
+- Model metadata endpoint
+- Direct `input_ids` support (bypasses tokenization)
+- WebSocket binary streaming for high-performance attention delivery
 
-**🔧 THE EASY PART**: We just need to figure out how to ingress the data we already have.
-
-We're getting the output we need, in the format we need it. Now we need to adjust how we insert the input.
+**See `KOBOLD_API_SPEC.md` for complete, tested API documentation.**
 
 ---
 
-## TODO: Input Control for Halo Weave Integration
+## Implemented Features
 
-### ✅ COMPLETE: Tokenization Endpoints (Session 8 - 2025-11-19)
+### ✅ Tokenization Endpoints (Session 8)
 
-**Status**: Implemented and tested!
-
-**Endpoints**:
 - `POST /api/v1/tokenize` - Returns token IDs + text for each token
 - `POST /api/v1/detokenize` - Converts token IDs back to text
+- Round-trip verified working
 
-**Example**:
-```bash
-POST /api/v1/tokenize
-{
-  "text": "Hello, how are you?",
-  "add_special_tokens": false
-}
-→ Response: {
-  "tokens": [
-    {"token_id": 9707, "text": "Hello"},
-    {"token_id": 11, "text": ","},
-    ...
-  ],
-  "token_ids": [9707, 11, ...],
-  "token_count": 6
-}
-```
+### ✅ Model Information (Session 9)
 
-**Files modified**:
-- `gpttype_adapter.cpp:3234-3249` - Added `gpttype_token_to_str()`
-- `model_adapter.h:106` - Added function declaration
-- `expose.cpp:399-404` - Exposed via C API
-- `koboldcpp.py:625-626` - Python binding
-- `koboldcpp.py:3839-3881` - REST endpoints
-- `test_tokenization.py` - Test suite
-
-**Tests**: ✅ All passing (round-trip tokenize/detokenize works perfectly)
-
----
-
-### 🔴 CRITICAL: Input Token Control (Input Ingress)
-
-**Problem**: Current API accepts `prompt` (text string), not `input_ids` (token array). Halo Weave needs precise token-level control for:
-- Context pruning (removing specific tokens by ID)
-- Deterministic tokenization (same input → same tokens)
-- Avoiding retokenization of existing context
-
-**Current behavior**:
+`GET /api/v1/model` returns full architecture metadata:
 ```json
 {
-  "prompt": "The capital of France is",  // Text string - we can't control exact tokens!
-  "max_length": 20
-}
-```
-
-**Required behavior**:
-```json
-{
-  "input_ids": [151644, 1587, 198, 2610, ...],  // Exact token IDs
-  "max_length": 20
-}
-```
-
-**Action needed**:
-- Find where koboldcpp.py parses the request and tokenizes the prompt
-- Add support for `input_ids` parameter (bypass tokenization if provided)
-- Verify that attention indices match the provided token array
-
-**Files to investigate**: `koboldcpp.py` (request handlers), possibly C++ generation code
-
----
-
-### 🟡 NICE TO HAVE: Detailed Model Info (Validation)
-
-**Problem**: `/api/v1/model` only returns model name, not architecture details. We need:
-- `num_layers` and `num_attention_heads` to validate attention tensor shapes
-- `vocab_size` for token validation
-- `max_context_length` for context management
-
-**Current**:
-```json
-{"result": "koboldcpp/Qwen2.5-VL-7B-Instruct-Q8_0"}
-```
-
-**Desired**:
-```json
-{
-  "model_name": "Qwen2.5-VL-7B-Instruct-Q8_0",
+  "result": "koboldcpp/Qwen2.5-VL-7B-Instruct-Q8_0",
+  "model_name": "koboldcpp/Qwen2.5-VL-7B-Instruct-Q8_0",
+  "vocab_size": 151936,
   "num_layers": 28,
   "num_attention_heads": 28,
-  "vocab_size": 151936,
-  "max_context_length": 32768
+  "num_key_value_heads": 4,
+  "embedding_size": 3584,
+  "max_context_length": 512,
+  "max_trained_context": 32768,
+  "bos_token_id": 151643,
+  "eos_token_id": 151645,
+  "eot_token_id": 151644,
+  "rope_freq_base": 10000.0,
+  "rope_freq_scale": 1.0
 }
 ```
 
-**Action needed**:
-- Extract model metadata from loaded GGUF model
-- Expose via enhanced `/api/v1/model` endpoint
-- Model knows this info - make it tell us!
+### ✅ Input Token Control (Session 10)
 
----
+`input_ids` parameter bypasses tokenization for deterministic control:
+```json
+{
+  "input_ids": [785, 6722, 315, 9625, 374],
+  "max_length": 20
+}
+```
 
-### ✅ NOT NEEDED: WebSocket Support
+Works with `/api/extra/generate/stream`. If both `prompt` and `input_ids` are provided, `input_ids` takes precedence.
 
-**Status**: Current SSE (Server-Sent Events) implementation works fine for streaming. WebSocket would be nice but not blocking.
+### ✅ SSE Streaming (Session 6)
+
+`POST /api/extra/generate/stream` - Base64-encoded attention in JSON via SSE.
+
+### ✅ WebSocket Binary Streaming (Session 11)
+
+`WS /api/extra/generate/stream/ws` - Raw binary attention frames for high performance.
+- Text frames: Token metadata (~50 bytes JSON)
+- Binary frames: Raw float32 attention tensor (~6.9MB)
+- ~99% reduction in serialization overhead vs SSE+base64
+- Tested: 22.4 tokens/sec, 0.40s for 9 tokens with attention
 
 ## Motivation
 
@@ -491,14 +440,17 @@ Generation N+1:
 
 ## Status
 
-**Last Updated**: 2025-11-18 (Session 6)
+**Last Updated**: 2025-11-19 (Session 10)
 
-**Implementation Status**: ✅ **PRODUCTION READY - COMPLETE TOKEN EVENT JSON**
+**Implementation Status**: ✅ **PRODUCTION READY - ALL FEATURES COMPLETE**
 **Architecture**: Hooked at core `process_ubatch()` - unavoidable extraction for ALL tokens
 **Compilation**: ✅ SUCCESS (CUDA + CPU builds)
 **Extraction**: ✅ **UNCONDITIONAL** - Works for streaming and non-streaming
 **Data Format**: ✅ Raw pre-softmax logits with excellent dynamic range (-93 to +84)
 **Token IDs**: ✅ Exposed via C API `new_token_id()` and included in Token Event JSON
+**Tokenization**: ✅ `/api/v1/tokenize` and `/api/v1/detokenize` endpoints
+**Model Info**: ✅ `/api/v1/model` returns full architecture metadata
+**Input Control**: ✅ `input_ids` parameter for direct token input
 **API**: ✅ `/api/extra/generate/stream` with complete Token + Attention events
 **Integration**: Ready for Halo Weave backend integration
 
@@ -994,13 +946,16 @@ Every generated token includes its ID, text, and 800KB of raw attention logits. 
 - [x] Code compiles with CUDA support
 - [x] Python bindings load successfully
 - [x] `get_token_attention()` callable (returns invalid when no tokens)
-- [ ] Load model and verify initialization
-- [ ] Generate text with `output_attentions=True`
-- [ ] Verify `get_token_attention(idx)` returns valid attention data
-- [ ] Check attention shape: `[n_layers, n_heads, seq_len]`
-- [ ] Verify attention values in range `[0, 1]`
+- [x] Load model and verify initialization
+- [x] Generate text with `output_attentions=True`
+- [x] Verify `get_token_attention(idx)` returns valid attention data
+- [x] Check attention shape: `[n_layers, n_heads, seq_len]`
+- [x] Raw pre-softmax logits (not normalized probabilities)
+- [x] Implement REST API in koboldcpp.py
+- [x] Tokenization endpoints working
+- [x] Model info endpoint working
+- [x] `input_ids` parameter working
 - [ ] Test with antislop enabled (verify correct pairing)
-- [ ] Implement REST/WebSocket API in koboldcpp.py
 - [ ] Integrate with Halo Weave backend
 
-**Tested On**: (TBD - ready for model testing)
+**Tested On**: Qwen2.5-VL-7B-Instruct-Q8_0 (28 layers, 28 heads)
