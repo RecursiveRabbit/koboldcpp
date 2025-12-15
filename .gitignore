@@ -149,3 +149,6 @@ conda/
 
 # Jetbrains idea folder
 .idea/
+
+# Python virtual environment
+venv/
