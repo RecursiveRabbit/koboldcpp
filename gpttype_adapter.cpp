@@ -51,17 +51,25 @@
 // ============================================================================
 
 void AttentionCapture::init(int max_heads, int max_ctx, int max_layers) {
-    buffer_capacity = (size_t)max_heads * max_ctx * max_layers;
-    fprintf(stderr, "DEBUG init: max_heads=%d, max_ctx=%d, max_layers=%d, buffer_capacity=%zu\n",
-            max_heads, max_ctx, max_layers, buffer_capacity);
+    // Main buffer: only need space for 1 layer now (last layer only)
+    buffer_capacity = (size_t)max_heads * max_ctx;
     buffer = (float*)malloc(buffer_capacity * sizeof(float));
     if (buffer == nullptr) {
-        fprintf(stderr, "ERROR: Failed to allocate attention buffer (%zu MB)\n",
-                buffer_capacity * sizeof(float) / (1024*1024));
+        fprintf(stderr, "ERROR: Failed to allocate attention buffer (%zu KB)\n",
+                buffer_capacity * sizeof(float) / 1024);
         buffer_capacity = 0;
     }
+
+    // Temp buffer for GPU->CPU copy (reused every token, never freed until shutdown)
+    temp_capacity = (size_t)max_heads * max_ctx;
+    temp_buffer = (float*)malloc(temp_capacity * sizeof(float));
+    if (temp_buffer == nullptr) {
+        fprintf(stderr, "ERROR: Failed to allocate temp buffer (%zu KB)\n",
+                temp_capacity * sizeof(float) / 1024);
+        temp_capacity = 0;
+    }
+
     reset();
-    fprintf(stderr, "DEBUG init DONE: buffer=%p\n", (void*)buffer);
 }
 
 void AttentionCapture::reset() {
@@ -91,6 +99,11 @@ void AttentionCapture::free_buffer() {
         buffer = nullptr;
     }
     buffer_capacity = 0;
+    if (temp_buffer) {
+        free(temp_buffer);
+        temp_buffer = nullptr;
+    }
+    temp_capacity = 0;
     reset();
 }
 
@@ -262,73 +275,57 @@ void attention_capture_callback(const llama_ubatch & ubatch,
 
 // Extract attention data from stored tensor pointers after graph execution
 // Call this AFTER graph_compute() returns, when tensor buffers are populated
-// UNCONDITIONAL - Always extract if there are pending tensors
+// OPTIMIZED: Only extracts LAST layer (all layers alias to same buffer anyway)
 void extract_pending_attention_data() {
     if (g_pending_attentions.empty()) {
         return;  // Nothing to extract
     }
 
-    // Reset buffer state for this token (don't accumulate across tokens)
+    // Reset buffer state for this token
     g_attention.reset();
 
-    for (const auto & pending : g_pending_attentions) {
-        ggml_tensor * cur = pending.tensor;
-        int il = pending.layer_idx;
+    // Only grab the last layer - all tensors alias to same buffer due to ggml memory optimization
+    const auto & pending = g_pending_attentions.back();
+    ggml_tensor * cur = pending.tensor;
 
-        // Verify buffer is assigned (should be, since graph executed)
-        if (cur->buffer == nullptr) {
-            fprintf(stderr, "WARNING: Tensor buffer still not assigned for layer %d after decode\n", il);
-            continue;
-        }
-
-        // Extract dimensions
-        int64_t seq_len_k = cur->ne[0];  // KV cache length (context)
-        int64_t seq_len_q = cur->ne[1];  // Query length (should be 1)
-        int64_t n_heads = cur->ne[2];    // Number of attention heads
-        int64_t batch = cur->ne[3];      // Batch size (should be 1)
-
-        // Calculate tensor size
-        size_t tensor_bytes = seq_len_k * seq_len_q * n_heads * batch * sizeof(float);
-
-        // Allocate CPU buffer for the data
-        float* tensor_data = (float*)malloc(tensor_bytes);
-        if (tensor_data == nullptr) {
-            fprintf(stderr, "ERROR: Failed to allocate CPU buffer for attention layer %d\n", il);
-            continue;
-        }
-
-        // Copy tensor from backend (GPU/CPU) to our CPU buffer
-        ggml_backend_tensor_get(cur, tensor_data, 0, tensor_bytes);
-
-        // Data layout in memory: [seq_len_k, seq_len_q, n_heads, batch]
-        // With seq_len_q=1, batch=1: effectively [seq_len_k, n_heads]
-        // We want [n_heads, seq_len_k] for easier processing
-        // Tensor indexing: tensor_data[k + q*seq_len_k + h*seq_len_k*seq_len_q + b*seq_len_k*seq_len_q*n_heads]
-        // With q=0, b=0: tensor_data[k + h*seq_len_k]
-
-        float* transposed = (float*)malloc(seq_len_k * n_heads * sizeof(float));
-        if (transposed == nullptr) {
-            fprintf(stderr, "ERROR: Failed to allocate transposed buffer for layer %d\n", il);
-            free(tensor_data);
-            continue;
-        }
-
-        for (int h = 0; h < n_heads; h++) {
-            for (int k = 0; k < seq_len_k; k++) {
-                // Input: [k, 0, h, 0] -> tensor_data[k + h*seq_len_k]
-                // Output: [h, k] -> transposed[h * seq_len_k + k]
-                transposed[h * seq_len_k + k] = tensor_data[k + h * seq_len_k];
-            }
-        }
-
-        // Append to global buffer
-        g_attention.append_layer(transposed, n_heads, seq_len_k);
-
-        free(transposed);
-        free(tensor_data);
+    // Verify buffer is assigned (should be, since graph executed)
+    if (cur->buffer == nullptr) {
+        g_pending_attentions.clear();
+        return;
     }
 
-    fprintf(stderr, "DEBUG: Extracted attention from %d layers\n", g_attention.n_layers_captured);
+    // Extract dimensions
+    int64_t seq_len_k = cur->ne[0];  // KV cache length (context)
+    int64_t n_heads = cur->ne[2];    // Number of attention heads
+
+    // Calculate tensor size
+    size_t tensor_floats = seq_len_k * n_heads;
+    size_t tensor_bytes = tensor_floats * sizeof(float);
+
+    // Use pre-allocated temp buffer (no malloc per token)
+    if (tensor_floats > g_attention.temp_capacity) {
+        // Rare case: context grew beyond initial allocation
+        g_pending_attentions.clear();
+        return;
+    }
+
+    // Single GPU->CPU copy (was 28 copies before)
+    ggml_backend_tensor_get(cur, g_attention.temp_buffer, 0, tensor_bytes);
+
+    // Transpose [seq_len_k, n_heads] -> [n_heads, seq_len_k] directly into output buffer
+    // Input:  temp_buffer[k + h*seq_len_k]
+    // Output: buffer[h * seq_len_k + k]
+    for (int h = 0; h < n_heads; h++) {
+        for (int k = 0; k < seq_len_k; k++) {
+            g_attention.buffer[h * seq_len_k + k] = g_attention.temp_buffer[k + h * seq_len_k];
+        }
+    }
+
+    // Update metadata
+    g_attention.buffer_used = tensor_floats;
+    g_attention.n_layers_captured = 1;
+    g_attention.n_heads = n_heads;
+    g_attention.seq_len = seq_len_k;
 
     // Clear pending list for next token
     g_pending_attentions.clear();

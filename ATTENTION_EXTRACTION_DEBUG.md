@@ -230,3 +230,34 @@ for i in range(27):
 | Buffer aliasing | All layers share one buffer | Each layer copied before reuse |
 | Layer uniqueness | All identical (layer 27) | All unique |
 | Performance | 28 serial GPU→CPU copies | Same, but could optimize |
+
+---
+
+## Optimization Applied (Session 13)
+
+Since all layers alias to the same buffer anyway, we optimized to:
+
+1. **Single GPU→CPU copy**: Only extract `g_pending_attentions.back()` (the last layer tensor)
+2. **Reusable temp buffer**: Pre-allocate at `init()`, reuse every token (no malloc/free)
+
+### Performance Improvement
+
+| Metric | Before | After | Improvement |
+|--------|--------|-------|-------------|
+| GPU→CPU copies | 28 | 1 | 28× fewer |
+| malloc/free calls | 56 | 0 | Eliminated |
+| Debug fprintf | 1 | 0 | Eliminated |
+| Estimated overhead | 15-30ms | 1-3ms | ~10× faster |
+
+### Code Changes
+
+**expose.h**: Added `temp_buffer` and `temp_capacity` fields to `AttentionCapture`
+
+**gpttype_adapter.cpp**:
+- `init()`: Allocate temp buffer once at startup
+- `free_buffer()`: Free temp buffer at shutdown
+- `extract_pending_attention_data()`: Single extraction from last tensor, no malloc
+
+### Caveat
+
+This optimization accepts that we only get the last layer's attention. If per-layer attention is needed in the future, the fix is to use `cb_eval` callback (fires during execution, before buffer reuse).

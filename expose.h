@@ -166,6 +166,10 @@ struct AttentionCapture {
     int seq_len = 0;
     // NO ENABLED FLAG - Unconditional extraction for all tokens
 
+    // Reusable temp buffer for GPU->CPU copy (avoids malloc/free per token)
+    float* temp_buffer = nullptr;
+    size_t temp_capacity = 0;
+
     void init(int max_heads, int max_ctx, int max_layers);
     void reset();
     void append_layer(const float* data, int heads, int len);
