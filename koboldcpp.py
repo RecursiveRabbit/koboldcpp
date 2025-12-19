@@ -1756,13 +1756,17 @@ def generate(genparams, stream_flag=False):
                 f.write(attention_array.tobytes())
             print(f"\n✅ Dumped {total_elements * 4} bytes of raw attention to raw_attention.bin")
 
+            # BANDWIDTH OPTIMIZATION: Send only first layer (all 28 "layers" are identical Layer 27)
+            # Reduces from 800KB to 28KB per token (28x reduction!)
+            single_layer = attention_array[0, :, :]  # Shape: [n_heads, seq_len]
+
             # Encode as base64
-            attention_bytes = attention_array.tobytes()
+            attention_bytes = single_layer.tobytes()
             attention_base64 = base64.b64encode(attention_bytes).decode('ascii')
 
             result["attention"] = {
                 "format": "per_layer",
-                "shape": [ret.attention_n_layers, ret.attention_n_heads, ret.attention_seq_len],
+                "shape": [1, ret.attention_n_heads, ret.attention_seq_len],  # [1, 28, 256]
                 "encoding": "base64",
                 "dtype": "float32",
                 "data": attention_base64
@@ -3177,13 +3181,18 @@ class KcppServerRequestHandler(http.server.SimpleHTTPRequestHandler):
                                 attention_array = np.ctypeslib.as_array(attn.data, shape=(total_elements,))
                                 attention_array = attention_array.reshape((attn.n_layers, attn.n_heads, attn.seq_len))
 
+                                # BANDWIDTH OPTIMIZATION: Send only first layer (all 28 "layers" are identical Layer 27)
+                                # Reduces from 800KB to 28KB per token (28x reduction!)
+                                # Client aggregates 28 heads → 256 values (fast, <1ms)
+                                single_layer = attention_array[0, :, :]  # Shape: [n_heads, seq_len]
+
                                 # Encode as base64 for JSON transmission
-                                attention_bytes = attention_array.tobytes()
+                                attention_bytes = single_layer.tobytes()
                                 attention_base64 = base64.b64encode(attention_bytes).decode('ascii')
 
                                 token_event["attention"] = {
                                     "format": "per_layer",
-                                    "shape": [attn.n_layers, attn.n_heads, attn.seq_len],
+                                    "shape": [1, attn.n_heads, attn.seq_len],  # [1, 28, 256]
                                     "context_length": attn.seq_len,
                                     "encoding": "base64",
                                     "dtype": "float32",
