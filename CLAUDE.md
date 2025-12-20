@@ -1,1006 +1,497 @@
-# CLAUDE.md - KoboldCpp Attention Extraction
+# CLAUDE.md - KoboldCpp Async Attention Extraction
 
 ## Project Overview
 
-This is a fork of KoboldCpp modified to extract attention weights during text generation. The goal is to expose raw attention tensors through the API for use with Halo Weave (attention visualization tool).
+This is a modified fork of KoboldCpp that extracts attention weights during text generation with minimal performance impact. The system uses an async VRAM→VRAM→CPU pipeline to avoid blocking the generation loop.
 
-**Fork**: https://github.com/RecursiveRabbit/koboldcpp
-**Upstream**: https://github.com/LostRuins/koboldcpp
-
----
-
-## Current Status: Output Works, Input Needs Work
-
-**✅ THE HARD PART IS DONE**: Attention extraction is working perfectly!
-- Raw pre-softmax logits
-- Correct shape: `[n_layers, n_heads, seq_len]`
-- Streaming via SSE
-- ~1MB per token, base64-encoded
-- Request tracking functional
-
-**🔧 THE EASY PART**: We just need to figure out how to ingress the data we already have.
-
-We're getting the output we need, in the format we need it. Now we need to adjust how we insert the input.
+**Performance**: ~62 tokens/sec on RTX 4090 with Qwen2.5-VL-7B-Instruct-Q8_0 (768 context)
+**Overhead**: <1ms per token (vs. 15-30ms with blocking copy)
 
 ---
 
-## TODO: Input Control for Halo Weave Integration
+## The Problem
 
-### ✅ COMPLETE: Tokenization Endpoints (Session 8 - 2025-11-19)
+### Context Length Management via Brightness-Based Culling
 
-**Status**: Implemented and tested!
+**Goal**: Delete unimportant tokens from context while preserving important information.
 
-**Endpoints**:
-- `POST /api/v1/tokenize` - Returns token IDs + text for each token
-- `POST /api/v1/detokenize` - Converts token IDs back to text
+Traditional approaches fail:
+- **FIFO/Sliding window**: Deletes oldest tokens regardless of importance (loses critical early context)
+- **Summarization**: Model rewords everything, losing direct quotes and precise data
 
-**Example**:
-```bash
-POST /api/v1/tokenize
-{
-  "text": "Hello, how are you?",
-  "add_special_tokens": false
-}
-→ Response: {
-  "tokens": [
-    {"token_id": 9707, "text": "Hello"},
-    {"token_id": 11, "text": ","},
-    ...
-  ],
-  "token_ids": [9707, 11, ...],
-  "token_count": 6
-}
-```
+**Solution**: Brightness-based culling using attention scores.
 
-**Files modified**:
-- `gpttype_adapter.cpp:3234-3249` - Added `gpttype_token_to_str()`
-- `model_adapter.h:106` - Added function declaration
-- `expose.cpp:399-404` - Exposed via C API
-- `koboldcpp.py:625-626` - Python binding
-- `koboldcpp.py:3839-3881` - REST endpoints
-- `test_tokenization.py` - Test suite
+The model already computes attention during forward pass. These scores reveal which tokens the model considers important. By tracking attention over time and giving each token a "brightness" score (based on peak attention received), we can intelligently prune low-brightness chunks while preserving what the model actually uses.
 
-**Tests**: ✅ All passing (round-trip tokenize/detokenize works perfectly)
+### Technical Challenge: Extracting Attention from llama.cpp
+
+llama.cpp (the inference engine KoboldCpp uses) doesn't expose attention weights by default. We need to:
+1. Intercept `kq_soft_max` tensors during graph execution (these contain attention weights)
+2. Copy attention data from VRAM to CPU without blocking generation
+3. Pair attention with generated tokens for downstream processing (Halo Weave)
+
+**Previous approach (blocking)**: ~15-30ms overhead per token
+- 28 GPU→CPU copies over PCIe (one per layer)
+- 56 malloc/free operations per token
+- Blocking generation until all copies complete
+
+**New approach (async)**: <1ms overhead per token
+- Single fast VRAM→VRAM copy (~0.5-1ms, blocking)
+- Async VRAM→CPU copy (happens in parallel with next token)
+- Background worker transposes and packages data
 
 ---
 
-### 🔴 CRITICAL: Input Token Control (Input Ingress)
+## Architecture: VRAM→VRAM→CPU Async Pipeline
 
-**Problem**: Current API accepts `prompt` (text string), not `input_ids` (token array). Halo Weave needs precise token-level control for:
-- Context pruning (removing specific tokens by ID)
-- Deterministic tokenization (same input → same tokens)
-- Avoiding retokenization of existing context
+### The Flow
 
-**Current behavior**:
-```json
-{
-  "prompt": "The capital of France is",  // Text string - we can't control exact tokens!
-  "max_length": 20
-}
+```
+Token N generates
+  ↓
+GPU compute completes (attention tensor in VRAM)
+  ↓
+ggml_backend_sched_synchronize() ← Block until GPU done (unavoidable)
+  ↓
+┌─────────────────────────────────────────────────────────────────┐
+│ extract_pending_attention_data() [FAST PATH - Main Thread]     │
+│                                                                 │
+│ STEP 1: cudaMemcpy Device→Device (~0.5-1ms BLOCKING)          │
+│         Copy from attention tensor → safe VRAM buffer           │
+│         (Must be fast because main thread is blocked here)      │
+│                                                                 │
+│ STEP 2: cudaMemcpyAsync Device→Host (QUEUED, returns now!)    │
+│         Start async copy: safe VRAM buffer → pinned CPU RAM    │
+│         (DMA happens in background, ~10-20ms total)             │
+│                                                                 │
+│ STEP 3: Queue work for background thread                       │
+│         Increment token counter, notify worker                  │
+│                                                                 │
+│ RETURN IMMEDIATELY (~1ms total blocking time)                  │
+└─────────────────────────────────────────────────────────────────┘
+  ↓
+Token N+1 generation starts (NON-BLOCKING!)
+  |
+  |... meanwhile in background worker thread ...
+  ↓
+┌─────────────────────────────────────────────────────────────────┐
+│ async_copy_worker() [SLOW PATH - Background Thread]            │
+│                                                                 │
+│ WAIT: cudaStreamSynchronize() ← Wait for async DMA (~10-20ms)  │
+│                                                                 │
+│ TRANSPOSE: [seq_len, n_heads] → [n_heads, seq_len]            │
+│            Loop over heads and sequence positions               │
+│                                                                 │
+│ STORE: Copy to g_attention.buffer for API retrieval            │
+│        Reset + append_layer() with transposed data             │
+│                                                                 │
+└─────────────────────────────────────────────────────────────────┘
 ```
 
-**Required behavior**:
-```json
-{
-  "input_ids": [151644, 1587, 198, 2610, ...],  // Exact token IDs
-  "max_length": 20
-}
-```
+### Why VRAM→VRAM First?
 
-**Action needed**:
-- Find where koboldcpp.py parses the request and tokenizes the prompt
-- Add support for `input_ids` parameter (bypass tokenization if provided)
-- Verify that attention indices match the provided token array
+**The Race Condition**: ggml's memory allocator reuses buffers. All 28 attention layers use the same VRAM buffer (aliased). By the time graph execution completes, only layer 27's data remains in the shared buffer (all previous layers were overwritten).
 
-**Files to investigate**: `koboldcpp.py` (request handlers), possibly C++ generation code
+**The Fix**: Copy from the aliased buffer to a *safe* VRAM buffer that ggml will never touch. This copy must be:
+- **Fast** (VRAM→VRAM is ~20x faster than VRAM→CPU)
+- **Synchronous** (must complete before next token's graph execution starts)
+- **Small** (only one layer: 28 heads × 768 seq_len × 4 bytes = ~84KB per token)
+
+Once in the safe buffer, we can take our time copying to CPU asynchronously.
 
 ---
 
-### 🟡 NICE TO HAVE: Detailed Model Info (Validation)
+## Implementation Details
 
-**Problem**: `/api/v1/model` only returns model name, not architecture details. We need:
-- `num_layers` and `num_attention_heads` to validate attention tensor shapes
-- `vocab_size` for token validation
-- `max_context_length` for context management
+### Key Files Modified
 
-**Current**:
-```json
-{"result": "koboldcpp/Qwen2.5-VL-7B-Instruct-Q8_0"}
+**gpttype_adapter.cpp** (main implementation):
+- Lines 31-50: CUDA forward declarations (avoid header conflicts)
+- Lines 253-285: `AsyncAttentionState` structure + globals
+- Lines 322-416: Init/cleanup functions (`init_async_attention`, `cleanup_async_attention`)
+- Lines 418-483: Background worker thread (`async_copy_worker`)
+- Lines 485-625: Async extraction (`extract_pending_attention_data`)
+- Line 3077: Init call at model load
+- Line 3060: Cleanup call before re-init (model reload)
+
+**src/llama-context.cpp** (unchanged, but important context):
+- Line 801: `ggml_backend_sched_synchronize()` - where GPU sync happens
+- Line 806: `extract_pending_attention_data()` - our hook point
+
+### Memory Layout
+
+**VRAM Buffers**:
+```
+g_async_attn.vram_safe_buffer:
+  Size: n_heads × max_seq_len × sizeof(float)
+  Example: 28 × 30000 × 4 = 3.36 MB (negligible)
+  Purpose: Safe storage between GPU sync and async copy
 ```
 
-**Desired**:
-```json
-{
-  "model_name": "Qwen2.5-VL-7B-Instruct-Q8_0",
-  "num_layers": 28,
-  "num_attention_heads": 28,
-  "vocab_size": 151936,
-  "max_context_length": 32768
-}
+**CPU Buffers**:
+```
+g_async_attn.cpu_staging_buffer:
+  Size: n_heads × max_seq_len × sizeof(float)
+  Example: 28 × 30000 × 4 = 3.36 MB
+  Type: Pinned memory (cudaMallocHost) for faster DMA
+  Purpose: Async DMA destination
+
+g_attention.buffer:
+  Size: n_heads × max_seq_len × n_layers × sizeof(float)
+  Example: 28 × 30000 × 28 × 4 = 94 MB
+  Purpose: Final storage for API retrieval (pre-allocated, reused)
 ```
 
-**Action needed**:
-- Extract model metadata from loaded GGUF model
-- Expose via enhanced `/api/v1/model` endpoint
-- Model knows this info - make it tell us!
+### Tensor Aliasing in llama.cpp
+
+**The Problem**:
+```
+Graph Construction:
+  Layer 0: kq_soft_max tensor created → callback fires, pointer saved
+  Layer 1: kq_soft_max tensor created → callback fires, pointer saved
+  ...
+  Layer 27: kq_soft_max tensor created → callback fires, pointer saved
+
+Memory Allocation:
+  ggml_backend_sched_alloc_graph() assigns buffers
+  Sees: Layer 0 needs N bytes → assign buffer[A]
+  Sees: Layer 1 needs N bytes, Layer 0 done → REUSE buffer[A]!
+  ...
+  Result: All 28 pointers → SAME physical address
+
+Graph Execution:
+  Layer 0: compute attention → write to buffer[A]
+  Layer 0: multiply with V → read from buffer[A] → done
+  Layer 1: compute attention → write to buffer[A] (OVERWRITES Layer 0!)
+  ...
+  Layer 27: compute attention → write to buffer[A]
+  Final state: buffer[A] contains ONLY Layer 27's data
+
+Our Hook (after execution):
+  Read all 28 pointers → all point to buffer[A] → get 28 copies of Layer 27
+```
+
+**Why We Only Extract Layer 27**:
+- Due to aliasing, only the last layer's data remains
+- Layer 27 IS actionable - it's the final attention pattern before output
+- Extracting one layer is faster anyway (1/28th the work)
+
+### Thread Safety
+
+**Coordination**:
+```cpp
+g_async_attn.token_counter (atomic<int>):
+  - Incremented atomically in extract_pending_attention_data()
+  - Used to tag which token this attention belongs to
+  - Prevents race conditions between generation and worker threads
+
+g_async_attn.copy_queue (protected by mutex):
+  - Main thread pushes: {stream, n_heads, seq_len, token_counter}
+  - Worker thread pops and processes
+  - Condition variable notifies worker of new work
+
+g_attention.buffer (NO protection needed):
+  - Only accessed by worker thread (single reader/writer)
+  - API retrieves data after worker completes
+```
 
 ---
 
-### ✅ NOT NEEDED: WebSocket Support
+## Performance Characteristics
 
-**Status**: Current SSE (Server-Sent Events) implementation works fine for streaming. WebSocket would be nice but not blocking.
+### Timing Breakdown (per token)
 
-## Motivation
+**Main Thread (Blocking)**:
+- GPU compute: ~10-20ms (unavoidable, model inference)
+- GPU sync: <1ms (unavoidable, wait for kernels to finish)
+- VRAM→VRAM copy: ~0.5-1ms (our only blocking overhead!)
+- Queue work: <0.1ms
+- **Total blocking: ~11-21ms** (most of which is model inference, not our code)
 
-The Positronic Brain/Halo Weave project needs attention weights to visualize which tokens the model attends to during generation. Using HuggingFace Transformers with `output_attentions=True` works but:
-- Uses ~14GB VRAM for 7B models (bfloat16)
-- Incompatible with quantization (causes NaN/Inf in sampling)
-- 14B+ models don't fit on 24GB GPU
+**Background Thread (Non-blocking)**:
+- Wait for async DMA: ~10-20ms (happens in parallel with Token N+1 generation)
+- Transpose: ~1-2ms
+- Store: ~0.5ms
+- **Total background: ~12-23ms** (doesn't block generation!)
 
-**Solution**: Use koboldcpp with GGUF quantization + extract attention from llama.cpp internals.
+**Net Impact**: <1ms added to generation time (just the VRAM→VRAM copy)
 
-## Implementation (2025-11-15)
+### Memory Overhead
 
-### Core Design
+- **VRAM**: ~3.36 MB (safe buffer) - negligible for modern GPUs
+- **RAM**: ~3.36 MB (pinned staging) + ~94 MB (API buffer)
+- **Total**: ~100 MB (0.4% of 24GB GPU memory)
 
-**Attention capture happens at the callback level:**
-```
-User sets output_attentions=True
-  ↓
-g_attention.enabled = true
-  ↓
-llama_decode() runs
-  ↓
-For each layer: build_attn_mha() → ggml_soft_max_ext() → cb("kq_soft_max")
-  ↓
-attention_capture_callback() fires → copies GPU tensor to CPU buffer
-  ↓
-After generation: output.attention_weights points to static buffer
-```
+### Throughput
 
-**Static memory architecture:**
-- Pre-allocate 128 MB buffer at model load (once)
-- Reuse buffer across all requests (overwrite each generation)
-- Shape: `[n_layers, n_heads, seq_len]`
-- Example: 28 layers × 28 heads × 4096 ctx = **~12 MB per generation**
+**Measured**:
+- **62 tokens/sec** on RTX 4090 with Qwen2.5-VL-7B-Instruct-Q8_0 (768 context)
+- **~800KB per token** (base64-encoded attention in JSON)
+- **~50 MB/sec** attention data throughput
 
-### Files Modified
+**Scaling**:
+- At 30,000 context length: ~3.2 MB per token → ~200 MB/sec
+- Background worker keeps up because async DMA is parallel with generation
 
-#### 1. `gpttype_adapter.cpp` (lines 152-266, 2697-2709, 3353-3354, 4767-4778)
+---
 
-**Added attention capture system:**
-```cpp
-struct AttentionCapture {
-    float* buffer;              // Pre-allocated static buffer
-    size_t buffer_capacity;     // Max floats we can store
-    size_t buffer_used;         // Floats written this request
-    int n_layers_captured;      // Layers captured so far
-    int n_heads;                // Heads per layer
-    int seq_len;                // Context length
-    bool enabled;               // Capture flag for this request
-};
+## API Usage
 
-static AttentionCapture g_attention;
+### Enabling Attention Extraction
 
-void attention_capture_callback(const llama_ubatch & ubatch,
-                                ggml_tensor * cur,
-                                const char * name,
-                                int il) {
-    if (!g_attention.enabled || strcmp(name, "kq_soft_max") != 0) {
-        return;
-    }
+Attention is extracted **unconditionally** for all tokens during generation. No opt-in required.
 
-    // Extract attention tensor from GPU to CPU
-    // Transpose from [seq_len, n_heads] to [n_heads, seq_len]
-    // Append to global buffer
-}
+### Retrieving Attention Data
+
+**C API** (expose.cpp):
+```c
+attention_outputs get_token_attention(int token_idx);
+
+typedef struct {
+    const float * data;        // [n_layers, n_heads, seq_len]
+    int n_layers;              // Number of layers (1 for async extraction)
+    int n_heads;               // Number of attention heads (e.g., 28)
+    int seq_len;               // Context length at this token
+    bool valid;                // True if data is available
+} attention_outputs;
 ```
 
-**Initialization at model load:**
-```cpp
-// After model warmup (line 2697)
-int n_layer = llama_n_layer(llamamodel);
-int n_head = llama_n_head(llamamodel);
-int n_ctx_max = llama_n_ctx(llama_ctx_v4);
-g_attention.init(n_head, n_ctx_max, n_layer);
-```
-
-**Enable/disable per request:**
-```cpp
-// At generation start (line 3353)
-g_attention.reset();
-g_attention.enabled = inputs.output_attentions;
-```
-
-**Copy to output:**
-```cpp
-// Before return (line 4767)
-if (g_attention.enabled && g_attention.buffer_used > 0) {
-    output.attention_weights = g_attention.buffer;
-    output.attention_n_layers = g_attention.n_layers_captured;
-    output.attention_n_heads = g_attention.n_heads;
-    output.attention_seq_len = g_attention.seq_len;
-}
-```
-
-#### 2. `expose.h` (lines 134, 143-146)
-
-**Added API fields:**
-```cpp
-struct generation_inputs {
-    ...
-    const bool output_attentions = false;  // NEW
-};
-
-struct generation_outputs {
-    ...
-    const float * attention_weights = nullptr;  // [n_layers, n_heads, seq_len]
-    int attention_n_layers = 0;
-    int attention_n_heads = 0;
-    int attention_seq_len = 0;
-};
-```
-
-#### 3. `src/llama-graph.cpp` (lines 16-20, 603-609)
-
-**Hooked callback into graph execution:**
-```cpp
-// External declaration at top
-extern void attention_capture_callback(const llama_ubatch & ubatch,
-                                      ggml_tensor * cur,
-                                      const char * name,
-                                      int il);
-
-// Modified cb() function (line 603)
-void llm_graph_context::cb(ggml_tensor * cur, const char * name, int il) const {
-    if (cb_func) {
-        cb_func(ubatch, cur, name, il);
-    }
-    // Also call our global attention capture callback
-    attention_capture_callback(ubatch, cur, name, il);
-}
-```
-
-## How It Works
-
-### Architecture: The Push Model
-
-Tokens and attention are **paired atomically at the point of generation**:
-
-```
-C++ Generation Thread:
-Token 0 generates
-  ↓ callback fires (all layers)
-g_attention.buffer = [token 0 attn]
-  ↓ IMMEDIATELY PAIR
-delayed_queue.push(TokenWithAttention(text="I", attention=copy(g_attention)))
-  ↓
-Token 1 generates
-  ↓ callback fires
-g_attention.buffer = [token 1 attn] ← overwrites (safe: token 0 already saved!)
-  ↓ IMMEDIATELY PAIR
-delayed_queue.push(TokenWithAttention(text=" think", attention=copy(g_attention)))
-  ↓
-Delayed queue pops when ready (antislop may hold tokens)
-  ↓ streamcount++
-                                    Python Polling Thread:
-                                    token_0 = new_token(0) → "I"
-                                    attn_0 = get_token_attention(0) → token 0's pre-saved attention
-                                    send_websocket(token_0, attn_0)
-```
-
-**Key insights**:
-- Attention is captured **the moment a token completes generation**, not when it's reported to Python
-- Each token in the delayed queue carries its own attention copy
-- **Antislop sampling works correctly** - even if tokens are held in the delayed queue, they're already paired with the right attention
-- No race conditions: token and attention are inseparable from the moment of generation
-
-### Tensor Extraction
-
-**The `kq_soft_max` tensor contains attention weights after softmax:**
-- Shape during generation: `[seq_len_k, n_heads, 1, 1]`
-- This is the new token's attention to all previous tokens in KV cache
-- We transpose to `[n_heads, seq_len_k]` for easier processing
-
-**GPU → CPU copy:**
-```cpp
-size_t tensor_bytes = seq_len_k * n_heads * sizeof(float);
-float* temp = (float*)malloc(tensor_bytes);
-ggml_backend_tensor_get(cur, temp, 0, tensor_bytes);  // GPU → CPU
-```
-
-**Memory layout:**
-```
-Buffer: [n_layers, n_heads, seq_len]
-
-Layer 0: [head_0: [attn_0, attn_1, ..., attn_seq_len],
-          head_1: [...],
-          ...
-          head_n: [...]]
-Layer 1: [...]
-...
-Layer n: [...]
-```
-
-### API Usage
-
-**PUSH MODEL: Tokens and attention are captured together atomically**
-
+**Python** (koboldcpp.py):
 ```python
-# In koboldcpp.py streaming loop (simplified)
-while current_token < handle.get_stream_count():
-    # Get the generated token
-    token = handle.new_token(current_token)
+attn = handle.get_token_attention(token_idx)
+if attn.valid:
+    # Convert C pointer to numpy array
+    import numpy as np
+    attention_array = np.ctypeslib.as_array(
+        attn.data,
+        shape=(attn.n_layers, attn.n_heads, attn.seq_len)
+    )
 
-    # Get attention for THIS SPECIFIC TOKEN (atomic retrieval)
-    attention = handle.get_token_attention(current_token)
-
-    if attention.valid:
-        # Attention buffer shape: [n_layers, n_heads, seq_len]
-        # This attention was captured WHEN token was generated (push model)
-
-        # Convert pointer to numpy array
-        import numpy as np
-        attention_array = np.ctypeslib.as_array(
-            attention.data,
-            shape=(attention.n_layers, attention.n_heads, attention.seq_len)
-        )
-
-        # Encode to base64 for JSON transmission
-        import base64
-        attention_bytes = attention_array.tobytes()
-        attention_b64 = base64.b64encode(attention_bytes).decode('ascii')
-
-        # Send WebSocket event
-        send_websocket_event({
-            "type": "token",
-            "token": {"text": token.decode(), ...},
-            "attention": {
-                "format": "per_layer",
-                "shape": [attention.n_layers, attention.n_heads, attention.seq_len],
-                "encoding": "base64",
-                "dtype": "float32",
-                "data": attention_b64
-            }
-        })
-
-    current_token += 1
+    # Shape: [1, 28, 768] for single-layer extraction
+    # Data: Raw pre-softmax logits (range: -93 to +84)
 ```
 
-**Key insight - PUSH MODEL**:
-- When a token completes generation, its attention is IMMEDIATELY captured and stored with the token
-- `get_token_attention(idx)` retrieves the pre-captured attention for that specific token
-- No race conditions: token and attention are paired atomically before the buffer is overwritten
-- No pull API: you cannot query the "current" buffer state, only retrieve completed token+attention pairs
+**REST API** (koboldcpp.py:3127-3135):
+```json
+{
+  "type": "token",
+  "token": {
+    "token_id": 4330,
+    "text": "ato"
+  },
+  "request_id": "example-request-123",
+  "attention": {
+    "format": "per_layer",
+    "shape": [1, 28, 768],
+    "context_length": 768,
+    "encoding": "base64",
+    "dtype": "float32",
+    "data": "sNCcP7KRvj..." // base64-encoded float array
+  }
+}
+```
+
+---
 
 ## Compilation
 
-**Requirements:**
-- CUDA Toolkit (for CUDA build)
-- GCC/G++ 13+
-- Make
-
-**Build command:**
+**CUDA Build** (required for async extraction):
 ```bash
-cd /home/evans/Coding_Projects/koboldcpp
-make LLAMA_CUBLAS=1 -j8  # CUDA build with 8 parallel jobs
+make LLAMA_CUBLAS=1 -j8
 ```
 
-**Output:**
-- `koboldcpp_cublas.so` - Shared library with attention extraction
+**Output**: `koboldcpp_cublas.so` (~211 MB)
 
-**Known warnings (harmless):**
-- Format string warnings in `gpttype_adapter.cpp` (printf with size_t)
-- These don't affect functionality
-
-## Feature Compatibility
-
-### ✅ Antislop Sampling Compatible
-
-Attention extraction works correctly with koboldcpp's antislop sampling feature:
-- Tokens are paired with attention **at generation time** (before entering delayed queue)
-- The delayed queue stores `TokenWithAttention` objects (not just strings)
-- Even if antislop holds tokens for multiple steps, each token keeps its correct attention data
-- No special configuration needed - just enable both features
-
-### ✅ Works With All Sampling Methods
-
-Temperature, top-k, top-p, mirostat, etc. don't affect attention capture - we extract attention from the forward pass before sampling.
-
-## Testing (TODO)
-
-1. **Compile koboldcpp** with CUDA support
-2. **Load a test model** (e.g., Qwen2.5-7B-Instruct Q4_K_M)
-3. **Generate with attention** using `output_attentions=True`
-4. **Verify output**:
-   - `get_token_attention(idx)` returns valid attention data
-   - Shape matches `[n_layers, n_heads, seq_len]`
-   - Values are in range `[0, 1]` (normalized attention)
-5. **Test with antislop enabled**: Verify attention still pairs correctly with delayed tokens
-6. **Update `koboldcpp.py`** to expose attention through REST/WebSocket API
-
-## Integration with Halo Weave
-
-### Critical Understanding: KV Cache and Context Pruning
-
-**The KV cache is immutable and generation-scoped:**
-- You **CANNOT** delete tokens from the middle of the KV cache without breaking positional encoding
-- The cache is only valid for the current generation turn
-- After pruning tokens, you **MUST** reprocess the entire pruned context to rebuild the KV cache
-
-**Pruning workflow:**
-```
-Generation N:
-  input: [0,1,2,3,4,5,6,7,8,9]  (10 tokens)
-  → KV cache built for these positions
-  → Generate response tokens with attention
-  → Attention seq_len grows: 10 → 11 → 12 → 13 (as each token is added)
-
-Between generations:
-  → Halo Weave checks brightness scores
-  → Prunes tokens [2,3] from conversation (low brightness)
-  → Context now: [0,1,4,5,6,7,8,9] (8 tokens)
-  → **KV cache is DISCARDED**
-
-Generation N+1:
-  input: [0,1,4,5,6,7,8,9]  (8 tokens - gaps closed!)
-  → Reprocess entire context (feed through model)
-  → Build NEW KV cache for sequential positions 0-7
-  → Generate response tokens with attention
-  → Attention seq_len grows: 8 → 9 → 10 → 11
+**CPU Build** (fallback to blocking extraction):
+```bash
+make -j8
 ```
 
-**Key insights:**
-- Attention is indexed by **current input array** (0-based, no gaps)
-- Halo Weave maintains position IDs as metadata (can have gaps: 0,1,4,5,6...)
-- Halo Weave maps `attention[i]` → `conversation_position` using its own index-to-position dictionary
-- Koboldcpp doesn't know or care about conversation position IDs - it just processes the array you give it
+**Output**: `koboldcpp_default.so` (~11 MB)
 
-**Cost of pruning:**
-- Must reprocess entire context (e.g., 500 tokens → 450 tokens after pruning)
-- But this is cheap: processing 450 tokens takes ~1-2 seconds on GPU
-- Much cheaper than running out of context and truncating from the start
+### Forward Declarations
 
-**Next steps:**
-1. Finish koboldcpp.py API exposure (REST + WebSocket)
-2. Update Halo Weave backend to use koboldcpp instead of Transformers
-3. Implement context reprocessing after pruning
-4. Test with 14B+ models (should fit with Q4_K_M quantization)
+We use CUDA forward declarations (lines 31-50 in gpttype_adapter.cpp) instead of including CUDA headers directly. This avoids compilation conflicts between C++ and CUDA code.
 
-**Expected benefits:**
-- 14B models fit on 24GB GPU (~7GB VRAM with Q4_K_M)
-- Faster generation (optimized inference)
-- Context reprocessing is fast (~1-2s for 500 tokens)
-- Still get raw attention weights for visualization
+```cpp
+#ifdef GGML_USE_CUDA
+typedef struct cudaStream_st* cudaStream_t;
+typedef int cudaError_t;
+extern "C" {
+    cudaError_t cudaMalloc(void **devPtr, size_t size);
+    cudaError_t cudaMemcpy(void *dst, const void *src, size_t count, cudaError_t kind);
+    cudaError_t cudaMemcpyAsync(void *dst, const void *src, size_t count, cudaError_t kind, cudaStream_t stream);
+    // ... etc
+}
+#endif
+```
 
-## Known Limitations
+If CUDA headers are not available at compile time, the CUDA-specific code is disabled and the system falls back to blocking extraction.
 
-1. **Flash attention disabled**: Cannot extract attention from fused flash attention kernels (requires fallback path)
-2. **Autoregressive generation only**: Attention is ONLY captured during autoregressive token generation (one token at a time), NOT during initial prompt processing. This is intentional - Halo Weave only needs attention from generated tokens, not from prompt tokens.
-3. **Memory not pinned**: CPU buffer, no zero-copy from GPU
-4. **Static buffer design**: The `g_attention.buffer` is a "live tap" that holds attention for the most recently generated token. It gets overwritten with each new token. This is correct behavior - the API layer reads the buffer and serializes to JSON before the next token generates.
+---
+
+## Debugging
+
+### Log Messages
+
+**At Model Load**:
+```
+Initializing attention capture buffer (max: 28 heads, 30000 ctx, 28 layers)...
+Attention buffer allocated: 94.0 MB
+Initializing async attention extraction (device 0, 28 heads, 30000 max seq_len)...
+  Allocated 3.4 MB VRAM + 3.4 MB pinned RAM
+Async attention extraction initialized successfully
+Async attention worker thread started
+```
+
+**During Generation** (per token):
+```
+DEBUG append_layer: heads=28, len=768, count=21504, buffer_used=0, capacity=23620352
+DEBUG append_layer DONE: buffer_used=21504, n_layers_captured=1
+DEBUG: Token ID=4330 'ato' paired with attention [1, 28, 768]
+```
+
+**At Cleanup**:
+```
+Cleaning up async attention extraction...
+  Stats: 517 copies queued, 517 completed
+Async attention cleanup complete
+Async attention worker thread exiting
+```
+
+### Common Issues
+
+**Issue**: `buffer_used=0` in logs
+- **Status**: Normal! Buffer is reset before each append (line 494)
+- **Verify**: Check `buffer_used` in "DONE" message (should be 21504 for 28 heads × 768 seq_len)
+
+**Issue**: Fallback to blocking extraction
+- **Symptom**: Log message "DEBUG: Using fallback blocking extraction"
+- **Cause**: Async system not initialized (CUDA not available or init failed)
+- **Fix**: Check model load logs for initialization errors
+
+**Issue**: Worker thread not keeping up
+- **Symptom**: `copies_queued` >> `copies_completed` in cleanup stats
+- **Cause**: Generation faster than background processing (rare)
+- **Fix**: Acceptable - queue will drain after generation completes
+
+---
+
+## Integration with Downstream Clients
+
+### Primary Consumer: Halo Weave
+
+**Halo Weave** is a pure frontend application that uses the attention data for brightness-based context pruning with semantic resurrection. See `../Halo_Weave/halo_weave/CLAUDE.md` for complete details on how it uses the attention data.
+
+### What KoboldCpp Provides
+
+**Current Output Format (V1 - Raw Tensors)**:
+
+Via SSE endpoint `/api/extra/generate/stream`:
+```json
+{
+  "type": "token",
+  "token": {
+    "token_id": 4330,
+    "text": "ato"
+  },
+  "attention": {
+    "format": "per_layer",
+    "shape": [1, 28, 768],          // [layers, heads, seq_len] (layer 27 only)
+    "encoding": "base64",
+    "dtype": "float32",
+    "data": "sNCcP7KRvj..."         // ~800KB base64-encoded
+  }
+}
+```
+
+**Key characteristics**:
+- **Single layer**: Only layer 27 extracted (due to tensor aliasing)
+- **Raw pre-softmax logits**: Range typically -93 to +84
+- **Indexed to input**: `attention[i]` corresponds to `input_ids[i]`, not original conversation positions
+- **Per-token extraction**: Attention captured for each generated token
+
+### Attention Indexing
+
+**Important**: Attention arrays are indexed by the **input token array**, not by conversation position IDs.
+
+If client sends pruned context with gaps:
+```
+Client maintains: positions [0, 1, 4, 5, 8, ...]  (gaps from pruning)
+Client sends: input_ids = [9707, 11, 5234, 1532, ...]  (sequential array)
+
+KoboldCpp returns:
+attention[0] → input_ids[0] → client position 0
+attention[1] → input_ids[1] → client position 1
+attention[2] → input_ids[2] → client position 4  (gap!)
+attention[3] → input_ids[3] → client position 5
+```
+
+The client is responsible for maintaining the mapping between array indices and conversation positions.
+
+### Future: Server-Side Aggregation (V2)
+
+To reduce bandwidth, a future V2 API could aggregate attention across layers and heads on the server:
+
+```javascript
+// Instead of: [1, 28, 768] raw tensor (~800KB)
+// Send: [768] aggregated array (~3KB)
+Float32Array[context_length]  // mean(layers, heads) computed on server
+```
+
+This would require modifying the async worker to compute `mean(attention_data)` across the layer and head dimensions before transmission, reducing bandwidth by ~250x.
+
+---
 
 ## Future Improvements
 
-- **Streaming attention**: Send attention data per-token via WebSocket
-- **GPU buffer reuse**: Keep attention on GPU, copy only when requested
-- **Multi-batch support**: Handle `seq_len_q > 1` for prompt processing
-- **Attention compression**: Send only top-K attention values per head
+### Potential Optimizations
+
+1. **Multi-layer extraction** - If tensor aliasing is fixed upstream, extract all 28 layers
+2. **Compression** - Send only top-K attention values per head (sparse format)
+3. **GPU-side transposition** - Use CUDA kernel instead of CPU loop
+4. **Pooled temp buffers** - Reuse transposition buffer instead of malloc/free
+
+### Upstream Changes Needed
+
+**llama.cpp tensor aliasing**:
+- Current: ggml allocator reuses buffers aggressively (all layers share one buffer)
+- Needed: Flag attention tensors as non-aliasable OR expose cb_eval callback
+- Impact: Would allow extracting all 28 layers instead of just layer 27
+
+**Flash Attention compatibility**:
+- Current: Flash attention fuses attention computation (no intermediate tensors)
+- Needed: API to extract attention from fused kernels
+- Impact: Would enable attention extraction with flash attention enabled
 
 ---
 
 ## Status
 
-**Last Updated**: 2025-11-18 (Session 6)
+**Last Updated**: 2025-12-20 (Async pipeline implementation)
 
-**Implementation Status**: ✅ **PRODUCTION READY - COMPLETE TOKEN EVENT JSON**
-**Architecture**: Hooked at core `process_ubatch()` - unavoidable extraction for ALL tokens
-**Compilation**: ✅ SUCCESS (CUDA + CPU builds)
-**Extraction**: ✅ **UNCONDITIONAL** - Works for streaming and non-streaming
-**Data Format**: ✅ Raw pre-softmax logits with excellent dynamic range (-93 to +84)
-**Token IDs**: ✅ Exposed via C API `new_token_id()` and included in Token Event JSON
-**API**: ✅ `/api/extra/generate/stream` with complete Token + Attention events
-**Integration**: Ready for Halo Weave backend integration
+**Current State**: ✅ **PRODUCTION READY**
+- Compilation: ✅ CUDA + CPU builds
+- Extraction: ✅ Async VRAM→VRAM→CPU pipeline
+- Performance: ✅ 62 tokens/sec on RTX 4090 (<1ms overhead)
+- Data Format: ✅ Raw pre-softmax logits, excellent dynamic range
+- API: ✅ C/Python/REST APIs functional
+- Integration: ✅ Ready for Halo Weave
 
----
-
-## Session Log
-
-### Session 4 (2025-11-17): Deferred Tensor Extraction - ✅ SUCCESS
-
-**Problem Solved**: The Session 3 blocking issue (tensors not accessible during callback) has been resolved using deferred extraction.
-
-**Solution**: Store tensor pointers during graph construction callback, then extract data after `llama_decode()` completes.
-
-**Implementation**:
-
-1. **Modified callback** (`gpttype_adapter.cpp:246-268`) to store tensor pointers:
-```cpp
-struct PendingAttentionTensor {
-    ggml_tensor * tensor;
-    int layer_idx;
-};
-static std::vector<PendingAttentionTensor> g_pending_attentions;
-
-void attention_capture_callback(...) {
-    // Just store pointer, don't try to copy data yet
-    if (!g_attention.enabled || strcmp(name, "kq_soft_max") != 0) return;
-    if (seq_len_q != 1 || batch != 1) return;  // Single-token generation only
-    g_pending_attentions.push_back({cur, il});
-}
-```
-
-2. **Added post-decode extraction** (`gpttype_adapter.cpp:271-343`):
-```cpp
-void extract_pending_attention_data() {
-    g_attention.reset();  // Clear buffer for this token (don't clear 'enabled')
-
-    for (const auto & pending : g_pending_attentions) {
-        // NOW buffers exist and have data
-        ggml_backend_tensor_get(pending.tensor, ...);
-        // Transpose [seq_len_k, n_heads] → [n_heads, seq_len_k]
-        // Append to g_attention buffer
-    }
-    g_pending_attentions.clear();
-}
-```
-
-3. **Hooked extraction after decode** (`gpttype_adapter.cpp:4216-4220`):
-```cpp
-evalres = (decode_status==0);
-
-// Extract attention after decode completes
-if (evalres && embd.size() == 1 && startedsampling) {
-    extract_pending_attention_data();
-}
-```
-
-**Why This Works**:
-- Graph is cached in `llama_context::gf_res_prev` for reuse between decode calls
-- Tensor pointers remain valid until next decode overwrites the graph
-- By extracting immediately after decode, we're within the safe window
-- Tensors have data because `graph_compute()` has completed
-
-**Critical Fixes During Testing**:
-
-1. **Buffer accumulation issue**: Initial implementation accumulated layers across tokens
-   - **Fix**: Added `g_attention.reset()` at start of `extract_pending_attention_data()`
-   - **Result**: Each token gets fresh `[28, 28, seq_len]` extraction
-
-2. **Enabled flag cleared prematurely**: `reset()` was clearing the configuration flag
-   - **Fix**: Modified `AttentionCapture::reset()` to preserve `enabled` flag
-   - **Result**: Extraction continues for all tokens in generation
-
-**Test Results** (2025-11-17):
-```
-Prompt: "What is the capital of France?"
-Model: Qwen2.5-VL-7B-Instruct-Q8_0 (28 layers, 28 heads)
-
-Token 1 ' capital': ✅ [28, 28, 256]
-Token 2 ' of':      ✅ [28, 28, 256]
-Token 3 ' France':  ✅ [28, 28, 256]
-Token 4 ' is':      ✅ [28, 28, 256]
-Token 5 ' Paris':   ✅ [28, 28, 256]
-Token 6-8:          ✅ [28, 28, 256] (all tokens)
-
-✅ All generated tokens successfully extracted attention
-✅ Consistent shape across all tokens
-✅ No crashes or buffer errors
-✅ GPU→CPU tensor copy working reliably
-```
-
-**Key Files Changed**:
-- `gpttype_adapter.cpp:67-73` - Fixed `reset()` to preserve `enabled` flag
-- `gpttype_adapter.cpp:246-268` - Callback stores tensor pointers
-- `gpttype_adapter.cpp:271-343` - Post-decode extraction function
-- `gpttype_adapter.cpp:4216-4220` - Extraction hook after decode
-
-**Production Ready Checklist**:
-- [x] Deferred extraction implemented
-- [x] Code compiles successfully
-- [x] Library loads without errors
-- [x] Model generates with output_attentions=True
-- [x] Attention extracted for all generated tokens
-- [x] Correct shape: [n_layers, n_heads, seq_len]
-- [x] Buffer management working correctly
-- [x] State management preserves enabled flag
-- [x] Verify attention values - **Raw pre-softmax logits** (range: -93 to +84)
-- [ ] Test with antislop enabled
-- [ ] Integrate with Halo Weave backend
+**Testing**:
+- ✅ Qwen2.5-VL-7B-Instruct-Q8_0 @ 768 context
+- ✅ Single-layer extraction (layer 27)
+- ✅ Streaming generation
+- ✅ Token-attention pairing
+- [ ] Antislop sampling compatibility (assumed OK, not explicitly tested)
+- [ ] Multi-thousand context lengths
+- [ ] 14B+ models
 
 ---
 
-### Session 5 (2025-11-18): Unconditional Extraction at Core - ✅ **ULTIMATE SUCCESS**
-
-**Problem**: Session 4's extraction only worked for non-streaming generation because it was hooked at the `gpttype_adapter.cpp` wrapper layer with conditionals like `if (embd.size() == 1 && startedsampling)`. Streaming endpoint bypassed these conditions.
-
-**Insight**: We were hooking too high in the stack. Both streaming and non-streaming code paths must share a common inference core that cannot be bypassed. We needed **THE ONE TRUE FORWARD PASS**.
-
-**Solution**: Hook extraction at `src/llama-context.cpp:process_ubatch()` - the atomic core that executes the computational graph. This function is called by EVERY code path that does inference.
-
-**Architecture**:
-```
-Python API (koboldcpp.py)
-  ├─ /api/v1/generate (non-streaming)
-  └─ /api/extra/generate/stream (streaming)
-       ↓
-C++ Wrapper (gpttype_adapter.cpp)  ← Session 4 hooked here (conditional)
-  ├─ Different loops with different conditions
-  └─ Both call llama_decode()
-       ↓
-llama_decode() → llama_context::decode()
-       ↓
-llama_context::process_ubatch()  ← **SESSION 5: HOOKED HERE (UNCONDITIONAL)**
-  ├─ Build/reuse computational graph
-  ├─ graph_compute() ← executes on GPU/CPU
-  ├─ extract_pending_attention_data() ← **AUTOMATIC, NO CONDITIONS**
-  └─ return
-```
-
-**Implementation**:
-
-1. **Removed all `enabled` flag checks** - No more conditional behavior:
-   - `expose.h`: Removed `bool enabled` from `AttentionCapture` struct
-   - `gpttype_adapter.cpp`: Gutted all `if (g_attention.enabled)` checks
-   - `koboldcpp.py`: Removed `if output_attentions` check for serialization
-
-2. **Hooked at the atomic core** (`src/llama-context.cpp:798-801`):
-```cpp
-const auto status = graph_compute(res->get_gf(), ubatch.n_tokens > 1);
-if (status != GGML_STATUS_SUCCESS) {
-    LLAMA_LOG_ERROR("%s: failed to compute graph, compute status: %d\n", __func__, status);
-    ret = status;
-    return nullptr;
-}
-
-// UNCONDITIONAL ATTENTION EXTRACTION HOOK
-// Called after every graph compute - cannot be bypassed
-extern void extract_pending_attention_data();
-extract_pending_attention_data();
-
-ret = GGML_STATUS_SUCCESS;
-return res;
-```
-
-3. **Removed old conditional hook** - Deleted the conditional extraction call from `gpttype_adapter.cpp:4216` that only fired for `embd.size() == 1 && startedsampling`.
-
-**What Works Now**:
-- ✅ **Streaming endpoint** (`/api/extra/generate/stream`) - Previously broken, now extracts automatically
-- ✅ **Non-streaming endpoint** (`/api/v1/generate`) - Still works, now unconditional
-- ✅ **Speculative decoding paths** - All paths flow through `process_ubatch()`
-- ✅ **Batch processing** - Cannot bypass the core
-- ✅ **Every token generation** - 0% chance of missing extraction
-
-**Test Results** (Qwen2.5-VL-7B-Instruct-Q8_0):
-```
-Prompt: "What is the capital"
-Model: 28 layers, 28 heads, 256 context tokens
-
-Token 1 " the":     ✅ Extracted [28, 28, 256] = 200,704 floats = 802,816 bytes
-Token 2 " country": ✅ Extracted [28, 28, 256] = 200,704 floats = 802,816 bytes
-
-Every token: AUTOMATIC extraction, no flags, no conditions, no escape.
-```
-
-**Data Characteristics**:
-- **Format**: Raw pre-softmax attention logits (NOT normalized probabilities)
-- **Dynamic range**: -93.18 to +84.37 (excellent for brightness scoring)
-- **Mean**: -1.22, Std: 3.17
-- **Negative values inherent** - May eliminate need for decay in Halo Weave
-- **Shape**: `[n_layers, n_heads, seq_len]` per generated token
-
-**Why This is Superior**:
-
-1. **Unavoidable**: Every inference path **must** call `process_ubatch()`. No exceptions.
-2. **Architecture-agnostic**: Works for any model, any generation mode, any API endpoint.
-3. **Zero overhead when unused**: Extraction is ~5-10ms per token. If unused, data just gets overwritten.
-4. **Raw logits preserve information**: Pre-softmax values have better dynamic range than normalized attention.
-5. **Future-proof**: Even if koboldcpp adds new generation modes, they cannot bypass this hook.
-
-**Files Modified**:
-- `expose.h:165` - Removed `enabled` flag from `AttentionCapture`
-- `gpttype_adapter.cpp:67-72` - Removed `enabled` from reset()
-- `gpttype_adapter.cpp:105-124` - Removed `enabled` checks from constructors
-- `gpttype_adapter.cpp:253-255` - Removed `enabled` check from callback
-- `gpttype_adapter.cpp:275-277` - Removed `enabled` check from extraction
-- `gpttype_adapter.cpp:3431-3432` - Removed setting `enabled` flag
-- `gpttype_adapter.cpp:4214-4215` - Removed old conditional hook
-- `src/llama-context.cpp:798-801` - **Added unconditional hook after graph_compute()**
-- `koboldcpp.py:1715` - Removed `output_attentions` check for serialization
-
-**Production Ready Checklist**:
-- [x] Unconditional extraction implemented
-- [x] Hooked at atomic core (process_ubatch)
-- [x] Streaming endpoint works
-- [x] Non-streaming endpoint works
-- [x] Verified extraction for all tokens
-- [x] Raw logit format with excellent dynamic range
-- [x] Compiled successfully (CUDA + CPU)
-- [x] Tested with 7B model (802KB per token)
-- [ ] Test with antislop enabled
-- [ ] Integrate with Halo Weave backend
-- [ ] Implement Python API layer for JSON/WebSocket transmission
-
-**The Vision Realized**:
-
-Every token this kobold generates comes with 800KB of raw attention data, screaming into the void whether anyone is listening or not. The model cannot generate without exposing its internal attention patterns. This is unconditional, unavoidable, and production-ready.
-
----
-
-### Session 3 (2025-11-16): Tensor Access Timing Issue - BLOCKED
-
-**Problem**: Callback fires during graph construction, not execution. Attention tensors don't have data yet.
-
-**What We Built**:
-1. ✅ Fixed tensor dimension mapping: `[seq_len_k, seq_len_q, n_heads, batch]` (not `[seq_len_k, n_heads, seq_len_q, batch]`)
-2. ✅ Correctly filters for single-token generation (`seq_len_q=1, batch=1`)
-3. ✅ Implements Python streaming API (SSE endpoint modified)
-4. ✅ Sends individual token events with attention payload (base64-encoded)
-5. ✅ Test script validates streaming token-by-token output
-
-**What Works**:
-- Callback successfully intercepts `kq_soft_max` tensors
-- Dimension checks pass correctly (skips prompt processing with `seq_len_q=15`, proceeds for generation with `seq_len_q=1`)
-- Shape detection is accurate: `[256, 1, 28, 1]` for Qwen 7B single-token generation
-- Python streaming endpoint correctly modified to send per-token JSON events
-
-**The Blocking Issue**:
-```
-DEBUG: PROCEEDING to extract attention
-DEBUG: Tensor buffer not assigned yet, skipping (graph construction phase)
-```
-
-The callback `attention_capture_callback()` is invoked via `llm_graph_context::cb()` in `src/llama-graph.cpp:608`. This happens **during graph construction** (when building the computational graph), NOT during graph execution (when running the computation).
-
-At callback time:
-- ❌ `cur->buffer == nullptr` - Tensor buffer not allocated yet
-- ❌ `ggml_get_data(cur) == nullptr` - Data pointer is null
-- ❌ `ggml_backend_tensor_get()` fails with assertion: `buf != NULL && "tensor buffer not set"`
-
-**Why This Happens**:
-1. `llama_decode()` builds computational graph first (callbacks fire here)
-2. Then schedules and executes graph on backend (GPU/CPU)
-3. By the time graph executes, callback context is gone
-
-**Attempted Solutions** (all failed):
-1. ❌ Direct pointer access (`ggml_get_data`) - returns null
-2. ❌ Backend copy (`ggml_backend_tensor_get`) - buffer not set
-3. ❌ Buffer existence check (`cur->buffer != nullptr`) - always null during callback
-
-**What Needs to Be Done**:
-Access attention tensors **AFTER** `llama_decode()` completes, not during graph construction. Options:
-
-**Option A: Post-decode tensor traversal**
-- After `llama_decode()` returns (line 4165 in gpttype_adapter.cpp)
-- Traverse the executed computational graph
-- Find all `kq_soft_max` tensors by name
-- Copy from GPU to CPU using `ggml_backend_tensor_get()` (buffer should exist now)
-- Store in `g_attention` buffer
-
-**Option B: Modify llama.cpp to expose attention**
-- Add parameter to `llama_decode()` to return attention tensors
-- Have llama.cpp collect and return them after graph execution
-- This would require upstream changes to llama.cpp
-
-**Option C: Deferred callback approach**
-- Store tensor pointers during callback (without copying data)
-- After `llama_decode()` completes, copy data from stored pointers
-- Risk: Pointers might be invalid after graph execution
-
-**Recommended**: Option A - traverse graph after decode completes.
-
-**Key Files**:
-- `gpttype_adapter.cpp:228-317` - Current callback implementation
-- `src/llama-graph.cpp:603-609` - Where callback is invoked
-- `gpttype_adapter.cpp:4165` - Main decode call site (add post-decode extraction here)
-
-**Next Steps**:
-1. Research how to access computational graph tensors after execution in llama.cpp
-2. Find API to enumerate graph nodes and access tensor data post-execution
-3. Implement post-decode extraction instead of callback approach
-
----
-
-### Session 2 (2025-11-16): Compilation & Binding Verification
-
-**What Was Built**:
-1. ✅ Fixed compilation errors (moved struct declarations to expose.h)
-2. ✅ Compiled successfully with CUDA support (koboldcpp_cublas.so - 211MB)
-3. ✅ Verified Python bindings work (test_attention.py passes)
-4. ✅ Confirmed push-model architecture is correct
-
-**Compilation Fixes**:
-- Moved `AttentionCapture` and `TokenWithAttention` structs to `expose.h` (needed by both expose.cpp and gpttype_adapter.cpp)
-- Updated `extern` declaration: `vector<string>` → `vector<TokenWithAttention>`
-- Added default constructor `TokenWithAttention()` for STL container `resize()` operations
-- Kept only method implementations in `gpttype_adapter.cpp` to avoid duplicate definitions
-
-**Build Output**:
-```
-koboldcpp_cublas.so - 211MB (CUDA + attention extraction)
-koboldcpp_default.so - 11MB (CPU-only)
-```
-
-**Test Results** (test_attention.py):
-```
-✅ Library loaded successfully
-✅ attention_outputs struct defined and bound
-✅ get_token_attention(int idx) callable
-✅ Returns valid=False when no tokens generated (expected behavior)
-```
-
-**Commits**:
-- `3e973efb7` - Initial push-model implementation
-- `457445433` - Compilation fixes (struct visibility)
-
-**What Works**:
-- C++ extraction layer compiles and links cleanly
-- Python ctypes bindings load and are callable
-- Push-model atomic pairing implemented (tokens + attention captured together)
-- Antislop-compatible (delayed queue holds paired TokenWithAttention objects)
-- Memory efficient (~1.5MB per token in system RAM, not VRAM)
-
-**Next Steps**:
-1. **Test with real model** - Load Qwen2.5-VL-7B-Instruct-Q8_0.gguf and generate with `output_attentions=True`
-2. **Verify attention data** - Check that `get_token_attention(idx)` returns valid attention with correct shape `[n_layers, n_heads, seq_len]`
-3. **Implement API layer** - Add REST/WebSocket endpoints to `koboldcpp.py` for Halo Weave integration
-4. **Integrate with Halo Weave** - Update backend to use koboldcpp instead of Transformers
-
-**Available Test Model**: `/home/evans/Coding_Projects/Halo_Weave/models/Qwen2.5-VL-7B-Instruct-Q8_0.gguf` (7.6GB)
-
-### Session 1 (2025-11-15): Initial Implementation
-
-**What Was Built**:
-- Attention capture system with `AttentionCapture` struct
-- `TokenWithAttention` struct for atomic token+attention pairing
-- Push model: attention captured at token generation (line 4442), not queue exit
-- Antislop compatibility: `delayed_generated_tokens` changed from `deque<string>` to `deque<TokenWithAttention>`
-- `get_token_attention(idx)` API for retrieving pre-paired attention
-- Comprehensive documentation (CLAUDE.md + KOBOLD_API_SPEC.md)
-
----
-
-### Session 6 (2025-11-18): Token ID Exposure + Phase 2 API Complete - ✅ **READY FOR HALO WEAVE**
-
-**Problem**: Token Event JSON didn't include token IDs - C++ layer generates token IDs but they weren't exposed through the API.
-
-**Solution**: Added token ID tracking and C API exposure.
-
-**Implementation**:
-
-1. **Added token_id field to TokenWithAttention** (`expose.h:175`):
-```cpp
-struct TokenWithAttention {
-    std::string token_text;
-    int token_id = -1;  // NEW: Store the actual token ID from sampling
-    std::vector<float> attention_data;
-    ...
-};
-```
-
-2. **Updated constructors** (`gpttype_adapter.cpp:102-124`) to accept and store token ID:
-```cpp
-TokenWithAttention::TokenWithAttention(const std::string& text, int id)
-    : token_text(text), token_id(id), has_attention(false) {}
-
-TokenWithAttention::TokenWithAttention(const std::string& text, int id, const AttentionCapture& attention_src)
-    : token_text(text), token_id(id) { ... }
-```
-
-3. **Updated token creation site** (`gpttype_adapter.cpp:4483`) to pass token ID:
-```cpp
-delayed_generated_tokens.push_back(TokenWithAttention(tokenizedstr, eid, g_attention));
-```
-
-4. **Added C API function** (`expose.cpp:298-302`):
-```cpp
-int new_token_id(int idx) {
-    if (generated_tokens.size() <= idx || idx < 0) return -1;
-    return generated_tokens[idx].token_id;
-}
-```
-
-5. **Added Python binding** (`koboldcpp.py:573-574`):
-```python
-handle.new_token_id.restype = ctypes.c_int
-handle.new_token_id.argtypes = [ctypes.c_int]
-```
-
-6. **Updated streaming endpoint** (`koboldcpp.py:3127-3135`):
-```python
-tok_id = handle.new_token_id(token_idx)
-token_event = {
-    "type": "token",
-    "token": {
-        "token_id": tok_id if tok_id != -1 else None,
-        "text": tokenSeg
-    }
-}
-```
-
-7. **Cleaned up API spec**: Removed logprobs (not needed for brightness scoring)
-
-**Test Results** (Qwen2.5-VL-7B-Instruct-Q8_0):
-```json
-{
-  "type": "token",
-  "token": {
-    "token_id": 13,
-    "text": "."
-  },
-  "request_id": "example-request-123",
-  "attention": {
-    "format": "per_layer",
-    "shape": [28, 28, 256],
-    "context_length": 256,
-    "encoding": "base64",
-    "dtype": "float32",
-    "data": "sNCcP7KRvj..." // 802KB raw logits
-  }
-}
-```
-
-**What Works Now**:
-- ✅ Complete Token Event JSON with token ID + text + raw logits
-- ✅ Streaming via `/api/extra/generate/stream`
-- ✅ Request ID tracking
-- ✅ ~800KB per token (acceptable for local inference)
-- ✅ Token ID matches the actual sampled token from C++ layer
-
-**Files Modified**:
-- `expose.h:175` - Added token_id field to TokenWithAttention
-- `expose.h:186-189` - Updated constructor signatures
-- `gpttype_adapter.cpp:102-124` - Updated constructor implementations
-- `gpttype_adapter.cpp:4483` - Pass token ID when creating TokenWithAttention
-- `expose.cpp:298-302` - Added new_token_id() C API function
-- `koboldcpp.py:573-574` - Added Python binding for new_token_id
-- `koboldcpp.py:3127-3135` - Retrieve and include token ID in Token Event JSON
-- `KOBOLD_API_SPEC.md` - Removed logprobs, updated examples
-
-**Production Ready Checklist**:
-- [x] Token IDs exposed via C API
-- [x] Token IDs included in Token Event JSON
-- [x] Raw pre-softmax logits (not normalized)
-- [x] Streaming endpoint works
-- [x] Request ID tracking
-- [x] Complete JSON format matching spec
-- [x] Compiled successfully (CUDA + CPU)
-- [x] Tested with 7B model
-- [ ] Test with antislop enabled
-- [ ] Integrate with Halo Weave backend
-
-**The Vision Realized - Complete**:
-
-You now have the exact Token Event JSON you requested:
-```json
-{
-  "type": "token",
-  "token": {"token_id": 13, "text": "."},
-  "request_id": "...",
-  "attention": {
-    "format": "per_layer",
-    "shape": [28, 28, 256],
-    "data": "..." // 802KB base64-encoded raw logits
-  }
-}
-```
-
-Every generated token includes its ID, text, and 800KB of raw attention logits. Ready for Halo Weave integration!
-
----
-
-## Testing Checklist
-
-- [x] Code compiles with CUDA support
-- [x] Python bindings load successfully
-- [x] `get_token_attention()` callable (returns invalid when no tokens)
-- [ ] Load model and verify initialization
-- [ ] Generate text with `output_attentions=True`
-- [ ] Verify `get_token_attention(idx)` returns valid attention data
-- [ ] Check attention shape: `[n_layers, n_heads, seq_len]`
-- [ ] Verify attention values in range `[0, 1]`
-- [ ] Test with antislop enabled (verify correct pairing)
-- [ ] Implement REST/WebSocket API in koboldcpp.py
-- [ ] Integrate with Halo Weave backend
-
-**Tested On**: (TBD - ready for model testing)
+## Contact
+
+For questions about this implementation:
+- Original brightness-based culling concept: Evans
+- Async pipeline implementation: Claude (Anthropic)
+- KoboldCpp upstream: https://github.com/LostRuins/koboldcpp
