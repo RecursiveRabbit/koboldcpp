@@ -3137,6 +3137,7 @@ class KcppServerRequestHandler(http.server.SimpleHTTPRequestHandler):
                     currfinishreason = ("length" if (sr!=1) else "stop")
                 tokenStr = ""
                 streamcount = handle.get_stream_count()
+
                 while current_token < streamcount:
                     token = handle.new_token(current_token)
 
@@ -3175,24 +3176,29 @@ class KcppServerRequestHandler(http.server.SimpleHTTPRequestHandler):
 
                             # Retrieve attention for this token (push model - already captured by C++ layer)
                             attn = handle.get_token_attention(token_idx)
+
                             if attn.valid:
                                 # Convert C pointer to numpy array
                                 total_elements = attn.n_layers * attn.n_heads * attn.seq_len
                                 attention_array = np.ctypeslib.as_array(attn.data, shape=(total_elements,))
                                 attention_array = attention_array.reshape((attn.n_layers, attn.n_heads, attn.seq_len))
 
-                                # BANDWIDTH OPTIMIZATION: Send only first layer (all 28 "layers" are identical Layer 27)
-                                # Reduces from 800KB to 28KB per token (28x reduction!)
-                                # Client aggregates 28 heads → 256 values (fast, <1ms)
+                                # BANDWIDTH OPTIMIZATION V2: Aggregate across heads on server
+                                # Old: Send [28 heads, seq_len] = 86KB base64 per token
+                                # New: Send [seq_len] = 3KB base64 per token (28x reduction!)
+                                # Client was already aggregating anyway, so same result, way less bandwidth
                                 single_layer = attention_array[0, :, :]  # Shape: [n_heads, seq_len]
 
+                                # Aggregate across heads (mean)
+                                aggregated = np.mean(single_layer, axis=0)  # Shape: [seq_len]
+
                                 # Encode as base64 for JSON transmission
-                                attention_bytes = single_layer.tobytes()
+                                attention_bytes = aggregated.tobytes()
                                 attention_base64 = base64.b64encode(attention_bytes).decode('ascii')
 
                                 token_event["attention"] = {
-                                    "format": "per_layer",
-                                    "shape": [1, attn.n_heads, attn.seq_len],  # [1, 28, 256]
+                                    "format": "aggregated",  # Signals pre-aggregated data
+                                    "shape": [attn.seq_len],  # [seq_len] instead of [1, heads, seq_len]
                                     "context_length": attn.seq_len,
                                     "encoding": "base64",
                                     "dtype": "float32",

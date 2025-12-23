@@ -385,7 +385,7 @@ Async attention worker thread exiting
 
 ### What KoboldCpp Provides
 
-**Current Output Format (V1 - Raw Tensors)**:
+**Current Output Format (V2 - Server-Side Aggregation)**:
 
 Via SSE (Server-Sent Events) streaming endpoint `/api/extra/generate/stream`:
 ```json
@@ -396,20 +396,27 @@ Via SSE (Server-Sent Events) streaming endpoint `/api/extra/generate/stream`:
     "text": "ato"
   },
   "attention": {
-    "format": "per_layer",
-    "shape": [1, 28, 768],          // [layers, heads, seq_len] (layer 27 only)
+    "format": "aggregated",
+    "shape": [768],                 // [seq_len] - pre-aggregated across heads
+    "context_length": 768,
     "encoding": "base64",
     "dtype": "float32",
-    "data": "sNCcP7KRvj..."         // ~800KB base64-encoded
+    "data": "sNCcP7..."             // ~3KB base64-encoded (28x smaller!)
   }
 }
 ```
 
 **Key characteristics**:
 - **Single layer**: Only layer 27 extracted (due to tensor aliasing)
-- **Post-softmax probabilities**: Range [0, 1], sums to ~1.0 per head
+- **Pre-aggregated**: Mean across 28 attention heads computed on server
+- **Post-softmax probabilities**: Range [0, 1], represents average attention weight
 - **Indexed to input**: `attention[i]` corresponds to `input_ids[i]`, not original conversation positions
 - **Per-token extraction**: Attention captured for each generated token
+- **Bandwidth optimized**: 3KB per token vs 86KB (28x reduction)
+
+**Performance impact** (measured on Qwen2.5-VL-7B-Instruct, 700 token generation):
+- Old format: 33.2s wall clock (2.3x slower than generation due to TCP send buffer blocking)
+- New format: 14.8s wall clock (1.06x generation time, effectively real-time)
 
 ### Attention Indexing
 
@@ -429,17 +436,21 @@ attention[3] → input_ids[3] → client position 5
 
 The client is responsible for maintaining the mapping between array indices and conversation positions.
 
-### Future: Server-Side Aggregation (V2)
+### Historical: V1 Format (Deprecated)
 
-To reduce bandwidth, a future V2 API could aggregate attention across layers and heads on the server:
+The original format sent raw per-head attention tensors:
 
-```javascript
-// Instead of: [1, 28, 768] raw tensor (~800KB)
-// Send: [768] aggregated array (~3KB)
-Float32Array[context_length]  // mean(layers, heads) computed on server
+```json
+{
+  "attention": {
+    "format": "per_layer",
+    "shape": [1, 28, 768],
+    "data": "..."  // 86KB base64-encoded
+  }
+}
 ```
 
-This would require modifying the async worker to compute `mean(attention_data)` across the layer and head dimensions before transmission, reducing bandwidth by ~250x.
+This format caused severe TCP send buffer blocking (90-100ms stalls every ~50 tokens) because the client couldn't read fast enough to keep up with generation. Replaced with server-side aggregation in V2.
 
 ---
 
