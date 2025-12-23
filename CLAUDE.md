@@ -106,17 +106,17 @@ Once in the safe buffer, we can take our time copying to CPU asynchronously.
 ### Key Files Modified
 
 **gpttype_adapter.cpp** (main implementation):
-- Lines 31-50: CUDA forward declarations (avoid header conflicts)
-- Lines 253-285: `AsyncAttentionState` structure + globals
-- Lines 322-416: Init/cleanup functions (`init_async_attention`, `cleanup_async_attention`)
-- Lines 418-483: Background worker thread (`async_copy_worker`)
-- Lines 485-625: Async extraction (`extract_pending_attention_data`)
-- Line 3077: Init call at model load
-- Line 3060: Cleanup call before re-init (model reload)
+- CUDA forward declarations (search for `#ifdef GGML_USE_CUDA`, near top of file)
+- `AsyncAttentionState` structure + globals (search for `struct AsyncAttentionState`)
+- Init/cleanup functions (search for `init_async_attention` and `cleanup_async_attention`)
+- Background worker thread (search for `async_copy_worker`)
+- Async extraction (search for `extract_pending_attention_data`)
+- Init call at model load (search for `init_async_attention(device_id`)
+- Cleanup happens automatically during re-initialization inside `init_async_attention()`
 
 **src/llama-context.cpp** (unchanged, but important context):
-- Line 801: `ggml_backend_sched_synchronize()` - where GPU sync happens
-- Line 806: `extract_pending_attention_data()` - our hook point
+- GPU sync happens (search for `ggml_backend_sched_synchronize()`)
+- Hook point (search for `extract_pending_attention_data()` call)
 
 ### Memory Layout
 
@@ -268,10 +268,10 @@ if attn.valid:
     )
 
     # Shape: [1, 28, 768] for single-layer extraction
-    # Data: Raw pre-softmax logits (range: -93 to +84)
+    # Data: Post-softmax attention probabilities (range: [0, 1], sums to ~1.0 per head)
 ```
 
-**REST API** (koboldcpp.py:3127-3135):
+**REST API** (koboldcpp.py, search for `output_attentions`):
 ```json
 {
   "type": "token",
@@ -362,7 +362,7 @@ Async attention worker thread exiting
 ### Common Issues
 
 **Issue**: `buffer_used=0` in logs
-- **Status**: Normal! Buffer is reset before each append (line 494)
+- **Status**: Normal! Buffer is reset before each append (search for `g_attention.reset()`)
 - **Verify**: Check `buffer_used` in "DONE" message (should be 21504 for 28 heads × 768 seq_len)
 
 **Issue**: Fallback to blocking extraction
@@ -387,7 +387,7 @@ Async attention worker thread exiting
 
 **Current Output Format (V1 - Raw Tensors)**:
 
-Via SSE endpoint `/api/extra/generate/stream`:
+Via SSE (Server-Sent Events) streaming endpoint `/api/extra/generate/stream`:
 ```json
 {
   "type": "token",
@@ -407,7 +407,7 @@ Via SSE endpoint `/api/extra/generate/stream`:
 
 **Key characteristics**:
 - **Single layer**: Only layer 27 extracted (due to tensor aliasing)
-- **Raw pre-softmax logits**: Range typically -93 to +84
+- **Post-softmax probabilities**: Range [0, 1], sums to ~1.0 per head
 - **Indexed to input**: `attention[i]` corresponds to `input_ids[i]`, not original conversation positions
 - **Per-token extraction**: Attention captured for each generated token
 
@@ -474,7 +474,7 @@ This would require modifying the async worker to compute `mean(attention_data)` 
 - Compilation: ✅ CUDA + CPU builds
 - Extraction: ✅ Async VRAM→VRAM→CPU pipeline
 - Performance: ✅ 62 tokens/sec on RTX 4090 (<1ms overhead)
-- Data Format: ✅ Raw pre-softmax logits, excellent dynamic range
+- Data Format: ✅ Post-softmax attention probabilities, normalized and interpretable
 - API: ✅ C/Python/REST APIs functional
 - Integration: ✅ Ready for Halo Weave
 

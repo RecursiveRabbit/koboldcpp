@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Validate that attention data contains raw pre-softmax logits with correct range.
+Validate that attention data contains post-softmax probabilities with correct range.
 Captures one token event and decodes the attention tensor.
 """
 
@@ -74,26 +74,26 @@ def validate_attention():
                     print(f"  Mean value: {attention_array.mean():.2f}")
                     print(f"  Std dev: {attention_array.std():.2f}")
 
-                    # Check if these are raw logits (not normalized)
+                    # Check if these are post-softmax probabilities (normalized)
                     sum_per_head = attention_array[0, 0, :].sum()
                     print(f"\nSum of attention for first head: {sum_per_head:.2f}")
 
                     if abs(sum_per_head - 1.0) < 0.01:
-                        print("  ⚠ Looks like normalized attention (sum ≈ 1.0)")
-                        print("  Expected: Raw pre-softmax logits (sum >> 1.0)")
-                        return False
+                        print("  ✓ Confirmed: Post-softmax probabilities (sum ≈ 1.0)")
                     else:
-                        print("  ✓ Confirmed: Raw pre-softmax logits (sum != 1.0)")
+                        print("  ⚠ Unexpected: Sum does not equal 1.0")
+                        print("  Expected: Post-softmax probabilities (sum ≈ 1.0)")
+                        return False
 
-                    # Check value range (logits should span ~[-100, +100])
-                    if attention_array.min() < -10 or attention_array.max() > 10:
-                        print(f"  ✓ Value range consistent with raw logits")
-                        print(f"  ✓ Dynamic range: {attention_array.max() - attention_array.min():.2f}")
+                    # Check value range (probabilities should be [0, 1])
+                    if attention_array.min() >= 0 and attention_array.max() <= 1.0:
+                        print(f"  ✓ Value range consistent with probabilities [0, 1]")
+                        print(f"  ✓ Dynamic range: {attention_array.max() - attention_array.min():.6f}")
                         return True
                     else:
-                        print(f"  ⚠ Values seem too small for raw logits")
-                        print(f"  Expected: -100 to +100 range")
-                        print(f"  Got: {attention_array.min():.2f} to {attention_array.max():.2f}")
+                        print(f"  ⚠ Values outside [0, 1] range")
+                        print(f"  Expected: 0.0 to 1.0 range")
+                        print(f"  Got: {attention_array.min():.6f} to {attention_array.max():.6f}")
                         return False
 
     print("✗ No attention data received")

@@ -203,7 +203,7 @@ make LLAMA_CUBLAS=1 -j8
 **Session 8 Complete**: ✅ Tokenization API implemented and tested
 **Overall Progress**:
 - ✅ Phase 1: C++ attention extraction (Session 5)
-- ✅ Phase 2: REST/WebSocket API (Session 6)
+- ✅ Phase 2: REST API with SSE streaming (Session 6)
 - ✅ **Phase 3: Tokenization endpoints (Session 8)**
 - ⏳ Phase 4: Input token control (next)
 

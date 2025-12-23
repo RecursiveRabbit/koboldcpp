@@ -184,7 +184,7 @@ make LLAMA_CUBLAS=1 -j$(nproc)
 **"Attention data not appearing":**
 - Ensure `output_attentions: true` in request
 - Check SSE endpoint URL: `/api/extra/generate/stream`
-- Verify browser console for WebSocket fallback messages
+- Verify SSE connection is established correctly
 
 **"Generation very slow":**
 - Check GPU layers: `--gpulayers 999` (all layers on GPU)
@@ -217,7 +217,6 @@ make LLAMA_CUBLAS=1 -j$(nproc)
 
 Possible optimizations for future versions:
 
-- **WebSocket with binary frames** - Further reduce latency (~5-10ms per token)
 - **Multi-layer capture** - If we fix the tensor reuse issue, capture all unique layers
 - **Compression** - Send top-K attention values only
 - **Async GPU→CPU** - Overlap attention transfer with generation

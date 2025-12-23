@@ -14,7 +14,7 @@
 - Unconditional attention tensor extraction at core `process_ubatch()`
 - GPU→CPU copy after graph execution
 - Shape: `[n_layers, n_heads, seq_len]` per token
-- Raw pre-softmax logits
+- Post-softmax attention probabilities (range [0, 1], sums to ~1.0 per head)
 - Verified with 20+ token generation
 
 ### ✅ Phase 2: REST API (COMPLETE)
@@ -44,6 +44,7 @@
 
 ### ⚠️ What Doesn't Exist
 - No non-streaming `/api/v1/generate` endpoint with attention data exposure
+- No WebSocket support (SSE only)
 
 **This document only shows TESTED, WORKING API calls.**
 
@@ -52,7 +53,7 @@
 ## What Works (Tested)
 
 ### Attention Extraction
-- **Format**: Raw pre-softmax logits (NOT normalized probabilities)
+- **Format**: Post-softmax attention probabilities (normalized, range [0, 1])
 - **Shape**: `[n_layers, n_heads, seq_len]` per generated token
 - **Size**: ~1.07MB per token (base64-encoded) for 28L/28H model
 - **Encoding**: base64 string in JSON
@@ -455,15 +456,14 @@ for line in response.iter_lines():
 2. **POST /api/v1/tokenize** - Tokenize text to token IDs + text
 3. **POST /api/v1/detokenize** - Convert token IDs back to text
 4. **POST /api/extra/generate/stream** - Streaming generation with attention
-5. Attention extraction: Raw pre-softmax logits, shape `[layers, heads, context]`
+5. Attention extraction: Post-softmax probabilities, shape `[layers, heads, context]`
 6. Base64 encoding for JSON transmission
 7. Request ID tracking
 8. SSE protocol for real-time streaming
 
 ### What Doesn't Exist ❌
 - No non-streaming generation with attention
-- No WebSocket support (uses HTTP + SSE instead)
-- No `input_ids` parameter for generation (still requires text prompt)
+- SSE (Server-Sent Events) only - no WebSocket support
 
 ### For Halo Weave Integration
 - ✅ Model metadata available via `/api/v1/model` (architecture validation)
