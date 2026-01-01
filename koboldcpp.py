@@ -267,6 +267,7 @@ class generation_inputs(ctypes.Structure):
                 ("banned_tokens_len", ctypes.c_int),
                 ("banned_tokens", ctypes.POINTER(ctypes.c_char_p)),
                 ("output_attentions", ctypes.c_bool),
+                ("output_hidden_states", ctypes.c_bool),
                 ("input_ids_len", ctypes.c_int),
                 ("input_ids", ctypes.POINTER(ctypes.c_int32))]
 
@@ -286,6 +287,12 @@ class attention_outputs(ctypes.Structure):
                 ("n_layers", ctypes.c_int),
                 ("n_heads", ctypes.c_int),
                 ("seq_len", ctypes.c_int),
+                ("valid", ctypes.c_bool)]
+
+class hidden_state_outputs(ctypes.Structure):
+    _fields_ = [("data", ctypes.POINTER(ctypes.c_float)),
+                ("n_embd", ctypes.c_int),
+                ("token_position", ctypes.c_int),
                 ("valid", ctypes.c_bool)]
 
 class sd_load_model_inputs(ctypes.Structure):
@@ -584,6 +591,8 @@ def init_library():
     handle.generate.restype = generation_outputs
     handle.get_token_attention.argtypes = [ctypes.c_int]
     handle.get_token_attention.restype = attention_outputs
+    handle.get_token_hidden_state.argtypes = [ctypes.c_int]
+    handle.get_token_hidden_state.restype = hidden_state_outputs
     handle.new_token.restype = ctypes.c_char_p
     handle.new_token.argtypes = [ctypes.c_int]
     handle.new_token_id.restype = ctypes.c_int
@@ -1566,6 +1575,7 @@ def generate(genparams, stream_flag=False):
     tool_call_fix = genparams.get('using_openai_tools', False)
     custom_token_bans = genparams.get('custom_token_bans', '')
     output_attentions = genparams.get('output_attentions', False)
+    output_hidden_states = genparams.get('output_hidden_states', False)
 
     for tok in custom_token_bans.split(','):
         tok = tok.strip()  # Remove leading/trailing whitespace
@@ -1721,6 +1731,7 @@ def generate(genparams, stream_flag=False):
         inputs.banned_tokens[n] = tok.encode("UTF-8")
 
     inputs.output_attentions = output_attentions
+    inputs.output_hidden_states = output_hidden_states
 
     currentusergenkey = genkey
     totalgens += 1
@@ -3126,6 +3137,7 @@ class KcppServerRequestHandler(http.server.SimpleHTTPRequestHandler):
         await asyncio.sleep(0.35) #anti race condition, prevent check from overtaking generate
 
         output_attentions = genparams.get('output_attentions', False)
+        output_hidden_states = genparams.get('output_hidden_states', False)
         request_id = genparams.get('request_id', None)  # Optional request ID for tracking
 
         try:
@@ -3154,8 +3166,8 @@ class KcppServerRequestHandler(http.server.SimpleHTTPRequestHandler):
                     if tokenSeg!="" and not badFragment:
                         incomplete_token_buffer.clear()
 
-                        # If attention extraction is enabled, send individual token events
-                        if output_attentions:
+                        # If attention or hidden state extraction is enabled, send individual token events
+                        if output_attentions or output_hidden_states:
                             import numpy as np
 
                             # Retrieve token ID from C++ layer
@@ -3174,39 +3186,61 @@ class KcppServerRequestHandler(http.server.SimpleHTTPRequestHandler):
                             if request_id:
                                 token_event["request_id"] = request_id
 
-                            # Retrieve attention for this token (push model - already captured by C++ layer)
-                            attn = handle.get_token_attention(token_idx)
+                            # Retrieve attention for this token if enabled (push model - already captured by C++ layer)
+                            if output_attentions:
+                                attn = handle.get_token_attention(token_idx)
 
-                            if attn.valid:
-                                # Convert C pointer to numpy array
-                                total_elements = attn.n_layers * attn.n_heads * attn.seq_len
-                                attention_array = np.ctypeslib.as_array(attn.data, shape=(total_elements,))
-                                attention_array = attention_array.reshape((attn.n_layers, attn.n_heads, attn.seq_len))
+                                if attn.valid:
+                                    # Convert C pointer to numpy array
+                                    total_elements = attn.n_layers * attn.n_heads * attn.seq_len
+                                    attention_array = np.ctypeslib.as_array(attn.data, shape=(total_elements,))
+                                    attention_array = attention_array.reshape((attn.n_layers, attn.n_heads, attn.seq_len))
 
-                                # BANDWIDTH OPTIMIZATION V2: Aggregate across heads on server
-                                # Old: Send [28 heads, seq_len] = 86KB base64 per token
-                                # New: Send [seq_len] = 3KB base64 per token (28x reduction!)
-                                # Client was already aggregating anyway, so same result, way less bandwidth
-                                single_layer = attention_array[0, :, :]  # Shape: [n_heads, seq_len]
+                                    # BANDWIDTH OPTIMIZATION V2: Aggregate across heads on server
+                                    # Old: Send [28 heads, seq_len] = 86KB base64 per token
+                                    # New: Send [seq_len] = 3KB base64 per token (28x reduction!)
+                                    # Client was already aggregating anyway, so same result, way less bandwidth
+                                    single_layer = attention_array[0, :, :]  # Shape: [n_heads, seq_len]
 
-                                # Aggregate across heads (mean)
-                                aggregated = np.mean(single_layer, axis=0)  # Shape: [seq_len]
+                                    # Aggregate across heads (mean)
+                                    aggregated = np.mean(single_layer, axis=0)  # Shape: [seq_len]
 
-                                # Encode as base64 for JSON transmission
-                                attention_bytes = aggregated.tobytes()
-                                attention_base64 = base64.b64encode(attention_bytes).decode('ascii')
+                                    # Encode as base64 for JSON transmission
+                                    attention_bytes = aggregated.tobytes()
+                                    attention_base64 = base64.b64encode(attention_bytes).decode('ascii')
 
-                                token_event["attention"] = {
-                                    "format": "aggregated",  # Signals pre-aggregated data
-                                    "shape": [attn.seq_len],  # [seq_len] instead of [1, heads, seq_len]
-                                    "context_length": attn.seq_len,
-                                    "encoding": "base64",
-                                    "dtype": "float32",
-                                    "data": attention_base64
-                                }
-                            else:
-                                # No attention data available for this token
-                                token_event["attention"] = None
+                                    token_event["attention"] = {
+                                        "format": "aggregated",  # Signals pre-aggregated data
+                                        "shape": [attn.seq_len],  # [seq_len] instead of [1, heads, seq_len]
+                                        "context_length": attn.seq_len,
+                                        "encoding": "base64",
+                                        "dtype": "float32",
+                                        "data": attention_base64
+                                    }
+                                else:
+                                    # No attention data available for this token
+                                    token_event["attention"] = None
+
+                            # Retrieve hidden state for this token if enabled
+                            if output_hidden_states:
+                                hidden = handle.get_token_hidden_state(token_idx)
+
+                                if hidden.valid:
+                                    # Convert C pointer to numpy array
+                                    hidden_array = np.ctypeslib.as_array(hidden.data, shape=(hidden.n_embd,))
+
+                                    # Encode as base64 for JSON transmission
+                                    hidden_bytes = hidden_array.tobytes()
+                                    hidden_base64 = base64.b64encode(hidden_bytes).decode('ascii')
+
+                                    token_event["hidden_state"] = {
+                                        "shape": [hidden.n_embd],
+                                        "encoding": "base64",
+                                        "dtype": "float32",
+                                        "data": hidden_base64
+                                    }
+                                else:
+                                    token_event["hidden_state"] = None
 
                             # Send token event immediately via SSE
                             event_str = json.dumps(token_event)
@@ -3215,8 +3249,8 @@ class KcppServerRequestHandler(http.server.SimpleHTTPRequestHandler):
                             # Normal mode: accumulate tokens
                             tokenStr += tokenSeg
 
-                # Send done event for attention mode
-                if output_attentions and streamDone:
+                # Send done event for attention/hidden state mode
+                if (output_attentions or output_hidden_states) and streamDone:
                     done_event = {
                         "type": "done",
                         "finish_reason": currfinishreason,
@@ -3227,8 +3261,8 @@ class KcppServerRequestHandler(http.server.SimpleHTTPRequestHandler):
                     event_str = json.dumps(done_event)
                     await self.send_kai_sse_event(event_str)
 
-                # Skip normal accumulation logic when in attention mode
-                if output_attentions:
+                # Skip normal accumulation logic when in attention/hidden state mode
+                if output_attentions or output_hidden_states:
                     if streamDone:
                         break
                     await asyncio.sleep(async_sleep_short)

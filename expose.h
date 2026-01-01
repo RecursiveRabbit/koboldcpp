@@ -132,6 +132,7 @@ struct generation_inputs
     const int banned_tokens_len = 0;
     const char ** banned_tokens = nullptr;
     const bool output_attentions = false;
+    const bool output_hidden_states = false;
     const int input_ids_len = 0;
     const int32_t * input_ids = nullptr;
 };
@@ -154,6 +155,14 @@ struct attention_outputs
     int n_heads = 0;
     int seq_len = 0;
     bool valid = false;  // True if attention data is available
+};
+
+struct hidden_state_outputs
+{
+    const float * data = nullptr;  // Pointer to hidden state buffer [n_embd]
+    int n_embd = 0;                // Hidden dimension (e.g., 3584 for Qwen2.5-7B)
+    int token_position = -1;       // Position in sequence this hidden state is for
+    bool valid = false;            // True if hidden state data is available
 };
 
 // Forward declarations for attention capture system
@@ -181,6 +190,11 @@ struct TokenWithAttention {
     int seq_len = 0;
     bool has_attention = false;
 
+    // Hidden state data
+    std::vector<float> hidden_state_data;
+    int n_embd = 0;
+    bool has_hidden_state = false;
+
     // Default constructor for resize() operations
     TokenWithAttention() = default;
 
@@ -189,6 +203,9 @@ struct TokenWithAttention {
 
     // Constructor for tokens with attention (copies from AttentionCapture buffer)
     TokenWithAttention(const std::string& text, int id, const AttentionCapture& attention_src);
+
+    // Set hidden state data (called separately from construction)
+    void set_hidden_state(const float* data, int embd_dim);
 };
 
 struct token_count_outputs

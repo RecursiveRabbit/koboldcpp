@@ -140,6 +140,24 @@ TokenWithAttention::TokenWithAttention(const std::string& text, int id, const At
     }
 }
 
+void TokenWithAttention::set_hidden_state(const float* data, int embd_dim) {
+    if (data != nullptr && embd_dim > 0) {
+        hidden_state_data.assign(data, data + embd_dim);
+        n_embd = embd_dim;
+        has_hidden_state = true;
+    } else {
+        has_hidden_state = false;
+    }
+}
+
+// Global flag for hidden state extraction (set per generation)
+static bool g_output_hidden_states = false;
+
+// Temporary storage for current token's hidden state (extracted after decode)
+static std::vector<float> g_current_hidden_state;
+static int g_current_hidden_state_dim = 0;
+static bool g_has_current_hidden_state = false;
+
 //const
 const int extra_context_handle_fragmentation = 128;
 const int MEDIA_TOKEN_IDENTIFIER_A = -998; //alternate between both, changing when image changes
@@ -3777,6 +3795,15 @@ generation_outputs gpttype_generate(const generation_inputs inputs)
     // Reset attention capture buffer (extraction is always-on)
     g_attention.reset();
 
+    // Enable hidden state extraction if requested
+    g_output_hidden_states = inputs.output_hidden_states;
+    if (g_output_hidden_states && llama_ctx_v4 != nullptr) {
+        llama_set_embeddings(llama_ctx_v4, true);
+        if (debugmode == 1) {
+            printf("\nHidden state extraction enabled for this generation.\n");
+        }
+    }
+
     double time0 = 0, time1 = 0, time2 = 0;
     timer_start();
 
@@ -4574,6 +4601,22 @@ generation_outputs gpttype_generate(const generation_inputs inputs)
                     // NOTE: Attention extraction now happens automatically in process_ubatch()
                     // No need for conditional hook here - it's unconditional at the core
 
+                    // Extract hidden state if enabled (during token generation, not prompt processing)
+                    g_has_current_hidden_state = false;
+                    if (g_output_hidden_states && evalres && embd.size() == 1) {
+                        // Single token generation - extract hidden state for this position
+                        const llama_model* model = llama_get_model(llama_ctx_v4);
+                        int n_embd = llama_model_n_embd(model);
+
+                        // Get hidden state at output position 0 (the token we just decoded)
+                        float* hidden_ptr = llama_get_embeddings_ith(llama_ctx_v4, 0);
+                        if (hidden_ptr != nullptr && n_embd > 0) {
+                            g_current_hidden_state.assign(hidden_ptr, hidden_ptr + n_embd);
+                            g_current_hidden_state_dim = n_embd;
+                            g_has_current_hidden_state = true;
+                        }
+                    }
+
                     if(draft_ctx)
                     {
                         evalres = (evalres && (llama_decode(draft_ctx, batch.batch)==0));
@@ -4841,6 +4884,15 @@ generation_outputs gpttype_generate(const generation_inputs inputs)
 
                     // PUSH MODEL: Pair token + attention AT GENERATION (before antislop delay)
                     delayed_generated_tokens.push_back(TokenWithAttention(tokenizedstr, eid, g_attention));
+
+                    // Attach hidden state if available
+                    if (g_has_current_hidden_state && !delayed_generated_tokens.empty()) {
+                        delayed_generated_tokens.back().set_hidden_state(
+                            g_current_hidden_state.data(),
+                            g_current_hidden_state_dim
+                        );
+                        g_has_current_hidden_state = false;  // Consume the hidden state
+                    }
 
                     while(delayed_generated_tokens.size() > delayed_generated_tokens_limit && delayed_generated_tokens.size() > 0)
                     {
@@ -5221,6 +5273,17 @@ generation_outputs gpttype_generate(const generation_inputs inputs)
         output.attention_n_heads = 0;
         output.attention_seq_len = 0;
     }
+
+    // Disable hidden state extraction and clean up
+    if (g_output_hidden_states && llama_ctx_v4 != nullptr) {
+        llama_set_embeddings(llama_ctx_v4, false);
+        if (debugmode == 1) {
+            printf("\nHidden state extraction disabled.\n");
+        }
+    }
+    g_output_hidden_states = false;
+    g_has_current_hidden_state = false;
+    g_current_hidden_state.clear();
 
     generation_finished = true;
     return output;

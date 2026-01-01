@@ -253,6 +253,37 @@ extern "C"
         return output;
     }
 
+    hidden_state_outputs get_token_hidden_state(int idx)
+    {
+        hidden_state_outputs output;
+
+        // Validate index
+        if (generated_tokens.size() <= idx || idx < 0) {
+            output.data = nullptr;
+            output.n_embd = 0;
+            output.token_position = -1;
+            output.valid = false;
+            return output;
+        }
+
+        // Get token with hidden state data
+        const TokenWithAttention& token_data = generated_tokens[idx];
+
+        if (token_data.has_hidden_state) {
+            output.data = token_data.hidden_state_data.data();
+            output.n_embd = token_data.n_embd;
+            output.token_position = idx;
+            output.valid = true;
+        } else {
+            output.data = nullptr;
+            output.n_embd = 0;
+            output.token_position = -1;
+            output.valid = false;
+        }
+
+        return output;
+    }
+
     bool sd_load_model(const sd_load_model_inputs inputs)
     {
         return sdtype_load_model(inputs);
