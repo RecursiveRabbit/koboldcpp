@@ -1762,11 +1762,6 @@ def generate(genparams, stream_flag=False):
             attention_array = np.ctypeslib.as_array(ret.attention_weights, shape=(total_elements,))
             attention_array = attention_array.reshape((ret.attention_n_layers, ret.attention_n_heads, ret.attention_seq_len))
 
-            # DEBUG: Dump raw buffer to file for inspection
-            with open("raw_attention.bin", "wb") as f:
-                f.write(attention_array.tobytes())
-            print(f"\n✅ Dumped {total_elements * 4} bytes of raw attention to raw_attention.bin")
-
             # BANDWIDTH OPTIMIZATION: Send only first layer (all 28 "layers" are identical Layer 27)
             # Reduces from 800KB to 28KB per token (28x reduction!)
             single_layer = attention_array[0, :, :]  # Shape: [n_heads, seq_len]

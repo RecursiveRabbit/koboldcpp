@@ -28,27 +28,6 @@
 
 #include "utils.h"
 
-// Forward declarations for CUDA types (avoid including CUDA headers in C++ compilation)
-#ifdef GGML_USE_CUDA
-struct cudaStream_st;
-typedef struct cudaStream_st* cudaStream_t;
-typedef int cudaError_t;
-extern "C" {
-    cudaError_t cudaGetDevice(int *device);
-    cudaError_t cudaMalloc(void **devPtr, size_t size);
-    cudaError_t cudaFree(void *devPtr);
-    cudaError_t cudaMallocHost(void **ptr, size_t size);
-    cudaError_t cudaFreeHost(void *ptr);
-    cudaError_t cudaMemcpy(void *dst, const void *src, size_t count, cudaError_t kind);
-    cudaError_t cudaMemcpyAsync(void *dst, const void *src, size_t count, cudaError_t kind, cudaStream_t stream);
-    cudaError_t cudaStreamSynchronize(cudaStream_t stream);
-    const char* cudaGetErrorString(cudaError_t error);
-}
-#define cudaSuccess 0
-#define cudaMemcpyDeviceToDevice 3
-#define cudaMemcpyDeviceToHost 2
-#endif
-
 //for easier compilation
 //concat source files into one file for compilation purposes
 #include "llama_v2.cpp"
@@ -277,49 +256,6 @@ struct PendingAttentionTensor {
 };
 static std::vector<PendingAttentionTensor> g_pending_attentions;
 
-// ============================================================================
-// ASYNC ATTENTION EXTRACTION (VRAM→VRAM→CPU)
-// ============================================================================
-
-struct PendingAttentionCopy {
-    void* cuda_stream;  // cudaStream_t (void* to avoid CUDA header dependencies here)
-    int n_heads;
-    int seq_len;
-    int token_counter;  // Which token this attention belongs to
-};
-
-struct AsyncAttentionState {
-    // VRAM buffer (safe from overwrites - never aliased by ggml)
-    float* vram_safe_buffer = nullptr;
-    size_t vram_buffer_capacity = 0;  // in floats
-
-    // CPU staging buffer (pinned memory for faster PCIe DMA)
-    float* cpu_staging_buffer = nullptr;
-
-    // CUDA resources
-    int cuda_device = -1;
-
-    // Background worker thread
-    std::thread worker_thread;
-    std::queue<PendingAttentionCopy> copy_queue;
-    std::mutex queue_mutex;
-    std::condition_variable queue_cv;
-    bool shutdown = false;
-
-    // Token counter for coordination
-    std::atomic<int> token_counter{0};
-
-    // Stats
-    std::atomic<int> copies_queued{0};
-    std::atomic<int> copies_completed{0};
-};
-static AsyncAttentionState g_async_attn;
-
-// Forward declarations
-void async_copy_worker();
-void init_async_attention(int device, int n_heads, int max_seq_len);
-void cleanup_async_attention();
-
 // Callback to capture attention tensor pointers during graph construction
 // NOTE: Tensors don't have data yet at this point - we just store pointers
 // UNCONDITIONAL - Always capture when kq_soft_max is seen
@@ -342,307 +278,64 @@ void attention_capture_callback(const llama_ubatch & ubatch,
         return;
     }
 
+    // Clear stale pointers when a NEW graph is being built (layer 0 = start of build)
+    // When graph is REUSED, this callback doesn't fire, so old pointers remain valid
+    if (il == 0) {
+        g_pending_attentions.clear();
+    }
+
     // Store the tensor pointer for later extraction (after graph execution)
     g_pending_attentions.push_back({cur, il});
 }
 
-// ============================================================================
-// ASYNC ATTENTION IMPLEMENTATION
-// ============================================================================
-
-// Initialize async attention extraction system
-void init_async_attention(int device, int n_heads, int max_seq_len) {
-    if (g_async_attn.vram_safe_buffer != nullptr) {
-        fprintf(stderr, "WARNING: Async attention already initialized, cleaning up first\n");
-        cleanup_async_attention();
-    }
-
-    g_async_attn.cuda_device = device;
-    size_t needed = n_heads * max_seq_len;
-
-    fprintf(stderr, "Initializing async attention extraction (device %d, %d heads, %d max seq_len)...\n",
-            device, n_heads, max_seq_len);
-
-#ifdef GGML_USE_CUDA
-    // Need to include CUDA headers for cudaMalloc/cudaMallocHost
-    extern void ggml_cuda_set_device(int device);
-    ggml_cuda_set_device(device);
-
-    // Allocate VRAM safe buffer (never overwritten by ggml)
-    cudaError_t err = cudaMalloc((void**)&g_async_attn.vram_safe_buffer, needed * sizeof(float));
-    if (err != cudaSuccess) {
-        fprintf(stderr, "ERROR: Failed to allocate VRAM safe buffer: %s\n", cudaGetErrorString(err));
-        return;
-    }
-    g_async_attn.vram_buffer_capacity = needed;
-
-    // Allocate CPU staging buffer (pinned memory for faster PCIe DMA)
-    err = cudaMallocHost((void**)&g_async_attn.cpu_staging_buffer, needed * sizeof(float));
-    if (err != cudaSuccess) {
-        fprintf(stderr, "ERROR: Failed to allocate pinned CPU buffer: %s\n", cudaGetErrorString(err));
-        cudaFree(g_async_attn.vram_safe_buffer);
-        g_async_attn.vram_safe_buffer = nullptr;
-        return;
-    }
-
-    fprintf(stderr, "  Allocated %.1f MB VRAM + %.1f MB pinned RAM\n",
-            (needed * sizeof(float)) / (1024.0 * 1024.0),
-            (needed * sizeof(float)) / (1024.0 * 1024.0));
-#else
-    fprintf(stderr, "WARNING: Async attention requires CUDA, skipping initialization\n");
-    return;
-#endif
-
-    // Reset counters
-    g_async_attn.token_counter = 0;
-    g_async_attn.copies_queued = 0;
-    g_async_attn.copies_completed = 0;
-    g_async_attn.shutdown = false;
-
-    // Start background worker thread
-    g_async_attn.worker_thread = std::thread(async_copy_worker);
-
-    fprintf(stderr, "Async attention extraction initialized successfully\n");
-}
-
-// Cleanup async attention extraction system
-void cleanup_async_attention() {
-    if (g_async_attn.vram_safe_buffer == nullptr) {
-        return;  // Not initialized
-    }
-
-    fprintf(stderr, "Cleaning up async attention extraction...\n");
-    fprintf(stderr, "  Stats: %d copies queued, %d completed\n",
-            g_async_attn.copies_queued.load(), g_async_attn.copies_completed.load());
-
-    // Signal shutdown
-    {
-        std::lock_guard<std::mutex> lock(g_async_attn.queue_mutex);
-        g_async_attn.shutdown = true;
-    }
-    g_async_attn.queue_cv.notify_all();
-
-    // Wait for worker thread to finish
-    if (g_async_attn.worker_thread.joinable()) {
-        g_async_attn.worker_thread.join();
-    }
-
-#ifdef GGML_USE_CUDA
-    // Free CUDA resources
-    extern void ggml_cuda_set_device(int device);
-    ggml_cuda_set_device(g_async_attn.cuda_device);
-
-    if (g_async_attn.vram_safe_buffer) {
-        cudaFree(g_async_attn.vram_safe_buffer);
-        g_async_attn.vram_safe_buffer = nullptr;
-    }
-    if (g_async_attn.cpu_staging_buffer) {
-        cudaFreeHost(g_async_attn.cpu_staging_buffer);
-        g_async_attn.cpu_staging_buffer = nullptr;
-    }
-#endif
-
-    g_async_attn.vram_buffer_capacity = 0;
-    fprintf(stderr, "Async attention cleanup complete\n");
-}
-
-// Background worker thread: waits for async copies, transposes, and stores attention
-void async_copy_worker() {
-    fprintf(stderr, "Async attention worker thread started\n");
-
-    while (true) {
-        PendingAttentionCopy copy;
-
-        // Wait for work
-        {
-            std::unique_lock<std::mutex> lock(g_async_attn.queue_mutex);
-            g_async_attn.queue_cv.wait(lock, [] {
-                return !g_async_attn.copy_queue.empty() || g_async_attn.shutdown;
-            });
-
-            if (g_async_attn.shutdown && g_async_attn.copy_queue.empty()) {
-                break;  // Exit thread
-            }
-
-            if (g_async_attn.copy_queue.empty()) {
-                continue;  // Spurious wakeup
-            }
-
-            copy = g_async_attn.copy_queue.front();
-            g_async_attn.copy_queue.pop();
-        }
-
-#ifdef GGML_USE_CUDA
-        // Wait for GPU→CPU async copy to complete
-        cudaStream_t stream = static_cast<cudaStream_t>(copy.cuda_stream);
-        cudaError_t err = cudaStreamSynchronize(stream);
-        if (err != cudaSuccess) {
-            fprintf(stderr, "ERROR: cudaStreamSynchronize failed: %s\n", cudaGetErrorString(err));
-            continue;
-        }
-
-        // Now cpu_staging_buffer has the data - transpose it
-        // Input layout: [seq_len, n_heads] (from tensor with seq_len_q=1)
-        // Output layout: [n_heads, seq_len]
-        float* transposed = (float*)malloc(copy.n_heads * copy.seq_len * sizeof(float));
-        if (!transposed) {
-            fprintf(stderr, "ERROR: Failed to allocate transposition buffer\n");
-            continue;
-        }
-
-        for (int h = 0; h < copy.n_heads; h++) {
-            for (int k = 0; k < copy.seq_len; k++) {
-                // Input: [k, h] -> cpu_staging_buffer[k + h * seq_len]
-                // Output: [h, k] -> transposed[h * seq_len + k]
-                transposed[h * copy.seq_len + k] =
-                    g_async_attn.cpu_staging_buffer[k + h * copy.seq_len];
-            }
-        }
-
-        // Store in global attention buffer for retrieval
-        // This matches the existing get_token_attention() API
-        g_attention.reset();
-        g_attention.append_layer(transposed, copy.n_heads, copy.seq_len);
-
-        free(transposed);
-
-        g_async_attn.copies_completed++;
-#endif
-    }
-
-    fprintf(stderr, "Async attention worker thread exiting\n");
-}
 
 // Extract attention data from stored tensor pointers after graph execution
 // Call this AFTER graph_compute() returns, when tensor buffers are populated
 // UNCONDITIONAL - Always extract if there are pending tensors
 //
-// NEW: Uses async VRAM→VRAM→CPU pipeline for minimal blocking time
+// Uses ggml_backend_tensor_get (synchronous) - same mechanism as logits transfer
+//
+// NOTE: We do NOT clear g_pending_attentions here. When graph is REUSED,
+// the callback doesn't fire, but the same tensor pointers are still valid.
+// Clearing happens in the callback when a NEW graph is built (at layer 0).
 void extract_pending_attention_data() {
     if (g_pending_attentions.empty()) {
-        return;  // Nothing to extract
+        return;  // Nothing to extract (shouldn't happen after first token)
     }
 
-    // ASYNC PATH: Fast VRAM→VRAM copy + async VRAM→CPU transfer
-#ifdef GGML_USE_CUDA
-    if (g_async_attn.vram_safe_buffer != nullptr) {
-        // Get CUDA backend and stream
-        extern llama_context * llama_ctx_v4;
-        if (llama_ctx_v4 == nullptr) {
-            fprintf(stderr, "ERROR: llama_ctx_v4 is null, cannot get CUDA stream\n");
-            g_pending_attentions.clear();
-            return;
-        }
-
-        // Get the last tensor (layer 27 - the one with valid data after aliasing)
-        const auto & pending = g_pending_attentions.back();
-        ggml_tensor * cur = pending.tensor;
-
-        if (cur->buffer == nullptr) {
-            fprintf(stderr, "WARNING: Tensor buffer not assigned, skipping extraction\n");
-            g_pending_attentions.clear();
-            return;
-        }
-
-        // Extract dimensions
-        int64_t seq_len_k = cur->ne[0];  // KV cache length (context)
-        int64_t n_heads = cur->ne[2];    // Number of attention heads
-        size_t tensor_bytes = seq_len_k * n_heads * sizeof(float);
-
-        // Verify buffer capacity
-        if ((size_t)(seq_len_k * n_heads) > g_async_attn.vram_buffer_capacity) {
-            fprintf(stderr, "ERROR: Attention tensor too large for async buffer (%zu > %zu floats)\n",
-                    (size_t)(seq_len_k * n_heads), g_async_attn.vram_buffer_capacity);
-            g_pending_attentions.clear();
-            return;
-        }
-
-        // Use default CUDA stream (stream 0) for async operations
-        // This avoids needing to access backend internals
-        cudaStream_t stream = nullptr;  // nullptr = default stream in CUDA
-
-        // STEP 1: Fast blocking VRAM→VRAM copy (~0.5-1ms)
-        // Copies from attention tensor (about to be overwritten) to safe buffer
-        cudaError_t err = cudaMemcpy(
-            g_async_attn.vram_safe_buffer,    // dst: safe VRAM buffer
-            (const char *)cur->data,          // src: attention tensor
-            tensor_bytes,
-            cudaMemcpyDeviceToDevice          // On-device copy (FAST!)
-        );
-        if (err != cudaSuccess) {
-            fprintf(stderr, "ERROR: cudaMemcpy D→D failed: %s\n", cudaGetErrorString(err));
-            g_pending_attentions.clear();
-            return;
-        }
-
-        // STEP 2: Start async VRAM→CPU copy (returns immediately!)
-        err = cudaMemcpyAsync(
-            g_async_attn.cpu_staging_buffer,  // dst: pinned CPU RAM
-            g_async_attn.vram_safe_buffer,    // src: safe VRAM buffer
-            tensor_bytes,
-            cudaMemcpyDeviceToHost,           // PCIe transfer (SLOW but async)
-            stream
-        );
-        if (err != cudaSuccess) {
-            fprintf(stderr, "ERROR: cudaMemcpyAsync D→H failed: %s\n", cudaGetErrorString(err));
-            g_pending_attentions.clear();
-            return;
-        }
-
-        // STEP 3: Queue for background processing
-        int current_token = g_async_attn.token_counter.fetch_add(1);
-        {
-            std::lock_guard<std::mutex> lock(g_async_attn.queue_mutex);
-            g_async_attn.copy_queue.push({
-                static_cast<void*>(stream),
-                (int)n_heads,
-                (int)seq_len_k,
-                current_token
-            });
-        }
-        g_async_attn.queue_cv.notify_one();
-        g_async_attn.copies_queued++;
-
-        g_pending_attentions.clear();
-        // RETURN IMMEDIATELY - generation continues while copy happens!
-        return;
-    }
-#endif
-
-    // FALLBACK: Old blocking sync path (if async not initialized or not CUDA)
-    fprintf(stderr, "DEBUG: Using fallback blocking extraction\n");
     g_attention.reset();
 
-    // Only extract last tensor (layer 27)
-    if (!g_pending_attentions.empty()) {
-        const auto & pending = g_pending_attentions.back();
-        ggml_tensor * cur = pending.tensor;
+    // Only extract last tensor (layer 27 - only one with valid data due to ggml buffer aliasing)
+    const auto & pending = g_pending_attentions.back();
+    ggml_tensor * cur = pending.tensor;
 
-        if (cur->buffer != nullptr) {
-            int64_t seq_len_k = cur->ne[0];
-            int64_t n_heads = cur->ne[2];
-            size_t tensor_bytes = seq_len_k * n_heads * sizeof(float);
+    if (cur->buffer == nullptr) {
+        return;  // Buffer not allocated, try again next token
+    }
 
-            float* tensor_data = (float*)malloc(tensor_bytes);
-            if (tensor_data != nullptr) {
-                ggml_backend_tensor_get(cur, tensor_data, 0, tensor_bytes);
+    int64_t seq_len_k = cur->ne[0];  // KV cache length (context)
+    int64_t n_heads = cur->ne[2];    // Number of attention heads
+    size_t tensor_bytes = seq_len_k * n_heads * sizeof(float);
 
-                float* transposed = (float*)malloc(tensor_bytes);
-                if (transposed != nullptr) {
-                    for (int h = 0; h < n_heads; h++) {
-                        for (int k = 0; k < seq_len_k; k++) {
-                            transposed[h * seq_len_k + k] = tensor_data[k + h * seq_len_k];
-                        }
-                    }
-                    g_attention.append_layer(transposed, n_heads, seq_len_k);
-                    free(transposed);
-                }
-                free(tensor_data);
-            }
+    // Use static buffers to avoid malloc/free per token
+    static std::vector<float> tensor_data;
+    static std::vector<float> transposed;
+    tensor_data.resize(seq_len_k * n_heads);
+    transposed.resize(seq_len_k * n_heads);
+
+    // Synchronous GPU→CPU copy via ggml backend (same path as logits - works reliably)
+    ggml_backend_tensor_get(cur, tensor_data.data(), 0, tensor_bytes);
+
+    // Transpose [seq_len, n_heads] → [n_heads, seq_len]
+    for (int h = 0; h < n_heads; h++) {
+        for (int k = 0; k < seq_len_k; k++) {
+            transposed[h * seq_len_k + k] = tensor_data[k + h * seq_len_k];
         }
     }
 
-    g_pending_attentions.clear();
+    g_attention.append_layer(transposed.data(), n_heads, seq_len_k);
+
+    // NOTE: Do NOT clear g_pending_attentions - tensor pointers are reused when graph is reused
 }
 static std::map<int,std::vector<int>> antislop_banned_token_ids; //first is the npast position, second is the array of banned ids at that index
 
@@ -3087,11 +2780,6 @@ ModelLoadResult gpttype_load_model(const load_model_inputs inputs, FileFormat in
             printf("Attention buffer allocated: %.1f MB\n",
                    (g_attention.buffer_capacity * sizeof(float)) / (1024.0 * 1024.0));
         }
-
-        // Initialize async attention extraction (VRAM→VRAM→CPU pipeline)
-        // Get CUDA device ID (assume device 0 for now, could be made configurable)
-        int cuda_device = 0;
-        init_async_attention(cuda_device, n_head, n_ctx_max);
 
         return ModelLoadResult::SUCCESS;
     }
