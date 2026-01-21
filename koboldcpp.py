@@ -269,7 +269,12 @@ class generation_inputs(ctypes.Structure):
                 ("output_attentions", ctypes.c_bool),
                 ("output_hidden_states", ctypes.c_bool),
                 ("input_ids_len", ctypes.c_int),
-                ("input_ids", ctypes.POINTER(ctypes.c_int32))]
+                ("input_ids", ctypes.POINTER(ctypes.c_int32)),
+                # Ouroboros mode: continuous representation preservation
+                ("ouroboros_mode", ctypes.c_bool),
+                ("ouroboros_embeddings", ctypes.POINTER(ctypes.c_float)),
+                ("ouroboros_embd_count", ctypes.c_int),
+                ("ouroboros_positions", ctypes.POINTER(ctypes.c_int32))]
 
 class generation_outputs(ctypes.Structure):
     _fields_ = [("status", ctypes.c_int),
@@ -293,6 +298,12 @@ class hidden_state_outputs(ctypes.Structure):
     _fields_ = [("data", ctypes.POINTER(ctypes.c_float)),
                 ("n_embd", ctypes.c_int),
                 ("token_position", ctypes.c_int),
+                ("valid", ctypes.c_bool)]
+
+class brightness_outputs(ctypes.Structure):
+    _fields_ = [("data", ctypes.POINTER(ctypes.c_float)),
+                ("ctx_len", ctypes.c_int),
+                ("sink_pos", ctypes.c_int),
                 ("valid", ctypes.c_bool)]
 
 class sd_load_model_inputs(ctypes.Structure):
@@ -593,6 +604,8 @@ def init_library():
     handle.get_token_attention.restype = attention_outputs
     handle.get_token_hidden_state.argtypes = [ctypes.c_int]
     handle.get_token_hidden_state.restype = hidden_state_outputs
+    handle.get_brightness.argtypes = []
+    handle.get_brightness.restype = brightness_outputs
     handle.new_token.restype = ctypes.c_char_p
     handle.new_token.argtypes = [ctypes.c_int]
     handle.new_token_id.restype = ctypes.c_int
@@ -618,6 +631,23 @@ def init_library():
     handle.get_pending_output.restype = ctypes.c_char_p
     handle.get_chat_template.restype = ctypes.c_char_p
     handle.get_model_info.restype = model_info_outputs
+    # Ouroboros API bindings
+    handle.ouroboros_init_buffer.argtypes = [ctypes.c_int, ctypes.c_int]
+    handle.ouroboros_init_buffer.restype = None
+    handle.ouroboros_clear_buffer.argtypes = []
+    handle.ouroboros_clear_buffer.restype = None
+    handle.ouroboros_store_generation.argtypes = []
+    handle.ouroboros_store_generation.restype = None
+    handle.ouroboros_count.argtypes = []
+    handle.ouroboros_count.restype = ctypes.c_int
+    handle.ouroboros_embedding.argtypes = [ctypes.c_int]
+    handle.ouroboros_embedding.restype = ctypes.POINTER(ctypes.c_float)
+    handle.ouroboros_token_id.argtypes = [ctypes.c_int]
+    handle.ouroboros_token_id.restype = ctypes.c_int
+    handle.ouroboros_position.argtypes = [ctypes.c_int]
+    handle.ouroboros_position.restype = ctypes.c_int
+    handle.ouroboros_n_embd.argtypes = []
+    handle.ouroboros_n_embd.restype = ctypes.c_int
     handle.calc_new_state_kv.restype = ctypes.c_size_t
     handle.calc_new_state_tokencount.restype = ctypes.c_size_t
     handle.calc_old_state_kv.argtypes = [ctypes.c_int]
@@ -1732,6 +1762,35 @@ def generate(genparams, stream_flag=False):
 
     inputs.output_attentions = output_attentions
     inputs.output_hidden_states = output_hidden_states
+
+    # Ouroboros mode: inject hidden states instead of token embeddings
+    ouroboros_mode = genparams.get('ouroboros_mode', False)
+    inputs.ouroboros_mode = ouroboros_mode
+    inputs.ouroboros_embd_count = 0
+    inputs.ouroboros_embeddings = None
+    inputs.ouroboros_positions = None
+
+    # Keep arrays alive during the call (prevent garbage collection)
+    _ouroboros_embd_array = None
+    _ouroboros_pos_array = None
+
+    if ouroboros_mode:
+        ouroboros_embeddings_b64 = genparams.get('ouroboros_embeddings', None)
+        ouroboros_positions = genparams.get('ouroboros_positions', [])
+        ouroboros_n_embd = genparams.get('ouroboros_n_embd', 0)
+
+        if ouroboros_embeddings_b64 and ouroboros_positions:
+            import numpy as np
+            # Decode base64 embeddings (base64 already imported at module level)
+            embd_bytes = base64.b64decode(ouroboros_embeddings_b64)
+            _ouroboros_embd_array = np.frombuffer(embd_bytes, dtype=np.float32).copy()
+
+            # Create ctypes arrays (keep references alive)
+            inputs.ouroboros_embd_count = len(ouroboros_positions)
+            inputs.ouroboros_embeddings = _ouroboros_embd_array.ctypes.data_as(ctypes.POINTER(ctypes.c_float))
+            _ouroboros_pos_array = (ctypes.c_int32 * len(ouroboros_positions))(*ouroboros_positions)
+            inputs.ouroboros_positions = ctypes.cast(_ouroboros_pos_array, ctypes.POINTER(ctypes.c_int32))
+            print(f"[Ouroboros] Prepared {inputs.ouroboros_embd_count} embeddings for injection at positions {ouroboros_positions[:5]}{'...' if len(ouroboros_positions) > 5 else ''}")
 
     currentusergenkey = genkey
     totalgens += 1
@@ -3191,6 +3250,39 @@ class KcppServerRequestHandler(http.server.SimpleHTTPRequestHandler):
                                     attention_array = np.ctypeslib.as_array(attn.data, shape=(total_elements,))
                                     attention_array = attention_array.reshape((attn.n_layers, attn.n_heads, attn.seq_len))
 
+                                    # DEBUG: Dump attention data to file for layer validation
+                                    debug_file = f"/tmp/attention_dump_token_{token_idx}.txt"
+                                    with open(debug_file, 'w') as f:
+                                        f.write(f"Token index: {token_idx}\n")
+                                        f.write(f"Shape: ({attn.n_layers}, {attn.n_heads}, {attn.seq_len})\n")
+                                        f.write(f"Total elements: {total_elements}\n\n")
+
+                                        # Per-layer statistics
+                                        f.write("Per-layer statistics:\n")
+                                        f.write("-" * 60 + "\n")
+                                        for layer_idx in range(attn.n_layers):
+                                            layer_data = attention_array[layer_idx]
+                                            f.write(f"Layer {layer_idx:2d}: mean={layer_data.mean():.6f}, std={layer_data.std():.6f}, max={layer_data.max():.6f}, min={layer_data.min():.6f}\n")
+
+                                        # Check for duplicate layers
+                                        f.write("\n" + "-" * 60 + "\n")
+                                        f.write("Layer similarity check (max abs diff from layer 0):\n")
+                                        layer0 = attention_array[0].flatten()
+                                        for layer_idx in range(1, min(attn.n_layers, 10)):  # First 10 layers
+                                            layer_n = attention_array[layer_idx].flatten()
+                                            max_diff = np.abs(layer0 - layer_n).max()
+                                            status = "DIFFERENT" if max_diff > 1e-6 else "DUPLICATE!"
+                                            f.write(f"Layer 0 vs Layer {layer_idx}: max_diff={max_diff:.6f} [{status}]\n")
+
+                                        # Sample values from first few layers
+                                        f.write("\n" + "-" * 60 + "\n")
+                                        f.write("Sample values (first 10 elements, head 0):\n")
+                                        for layer_idx in range(min(5, attn.n_layers)):
+                                            vals = attention_array[layer_idx, 0, :10]
+                                            f.write(f"Layer {layer_idx}: {vals}\n")
+
+                                    print(f"[DEBUG] Attention dumped to {debug_file}")
+
                                     # BANDWIDTH OPTIMIZATION V2: Aggregate across heads on server
                                     # Old: Send [28 heads, seq_len] = 86KB base64 per token
                                     # New: Send [seq_len] = 3KB base64 per token (28x reduction!)
@@ -3208,6 +3300,8 @@ class KcppServerRequestHandler(http.server.SimpleHTTPRequestHandler):
                                         "format": "aggregated",  # Signals pre-aggregated data
                                         "shape": [attn.seq_len],  # [seq_len] instead of [1, heads, seq_len]
                                         "context_length": attn.seq_len,
+                                        "n_layers": attn.n_layers,  # For debugging multi-layer extraction
+                                        "n_heads": attn.n_heads,
                                         "encoding": "base64",
                                         "dtype": "float32",
                                         "data": attention_base64
@@ -3682,6 +3776,27 @@ Change Mode<br>
                     "quiet": is_quiet,
                 }
             ).encode()
+
+        elif self.path.endswith('/api/extra/brightness'):
+            if not self.secure_endpoint():
+                return
+            brightness = handle.get_brightness()
+            if brightness.valid and brightness.ctx_len > 0:
+                # Convert C pointer to list
+                brightness_list = [brightness.data[i] for i in range(brightness.ctx_len)]
+                response_body = (json.dumps({
+                    "data": brightness_list,
+                    "ctx_len": brightness.ctx_len,
+                    "sink_pos": brightness.sink_pos,
+                    "valid": True
+                }).encode())
+            else:
+                response_body = (json.dumps({
+                    "data": [],
+                    "ctx_len": 0,
+                    "sink_pos": -1,
+                    "valid": False
+                }).encode())
 
         elif self.path.endswith('/api/extra/generate/check'):
             if not self.secure_endpoint():

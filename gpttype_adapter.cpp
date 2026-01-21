@@ -16,6 +16,8 @@
 #include <atomic>
 #include <unordered_map>
 #include <unordered_set>
+#include <set>
+#include <memory>
 #include "model_adapter.h"
 #include "otherarch.h"
 #include "llama.h"
@@ -50,14 +52,54 @@
 #include "common/common.h"
 
 // ============================================================================
+// ATTENTION TAP: CUDA kernel side-channel for multi-layer attention extraction
+// These functions are implemented in ggml/src/ggml-cuda/softmax.cu
+// They provide access to attention data captured during forward pass,
+// bypassing ggml's buffer aliasing that prevents post-hoc extraction.
+// ============================================================================
+#if defined(GGML_USE_CUDA)
+extern void attention_tap_init(int max_layers, int max_heads, int max_ctx);
+extern void attention_tap_free();
+extern void attention_tap_reset();
+extern bool attention_tap_extract(float ** out_data, int * out_n_layers, int * out_n_heads, int * out_seq_len);
+extern void attention_tap_update_brightness(void * stream);  // cudaStream_t
+
+// Brightness engine - GPU-side token importance scoring
+extern void brightness_init(int max_ctx);
+extern void brightness_free();
+extern void brightness_reset();
+extern void brightness_request_readback(void * stream);
+extern bool brightness_get_data(const float ** out_data, int * out_len);
+extern int brightness_get_sink_pos();
+#else
+// Stubs for non-CUDA builds
+inline void attention_tap_init(int, int, int) {}
+inline void attention_tap_free() {}
+inline void attention_tap_reset() {}
+inline bool attention_tap_extract(float **, int *, int *, int *) { return false; }
+inline void attention_tap_update_brightness(void *) {}
+inline void brightness_init(int) {}
+inline void brightness_free() {}
+inline void brightness_reset() {}
+inline void brightness_request_readback(void *) {}
+inline bool brightness_get_data(const float **, int *) { return false; }
+inline int brightness_get_sink_pos() { return -1; }
+#endif
+
+// ============================================================================
 // ATTENTION CAPTURE SYSTEM IMPLEMENTATIONS (for Halo Weave)
 // Struct declarations are in expose.h
 // ============================================================================
 
-void AttentionCapture::init(int max_heads, int max_ctx, int max_layers) {
-    buffer_capacity = (size_t)max_heads * max_ctx * max_layers;
+void AttentionCapture::init(int heads_max, int ctx_max, int layers_max) {
+    // Store max dimensions for stride calculations
+    this->max_heads = heads_max;
+    this->max_ctx = ctx_max;
+    this->max_layers = layers_max;
+
+    buffer_capacity = (size_t)heads_max * ctx_max * layers_max;
     fprintf(stderr, "DEBUG init: max_heads=%d, max_ctx=%d, max_layers=%d, buffer_capacity=%zu\n",
-            max_heads, max_ctx, max_layers, buffer_capacity);
+            heads_max, ctx_max, layers_max, buffer_capacity);
     buffer = (float*)malloc(buffer_capacity * sizeof(float));
     if (buffer == nullptr) {
         fprintf(stderr, "ERROR: Failed to allocate attention buffer (%zu MB)\n",
@@ -136,6 +178,99 @@ static bool g_output_hidden_states = false;
 static std::vector<float> g_current_hidden_state;
 static int g_current_hidden_state_dim = 0;
 static bool g_has_current_hidden_state = false;
+
+// ============================================================================
+// OUROBOROS SYSTEM: Continuous representation preservation
+// Stores pre-unembedding hidden states for re-injection on next turn
+// ============================================================================
+
+void OuroborosBuffer::init(int embd_dim, int max_tokens) {
+    n_embd = embd_dim;
+    embeddings.reserve((size_t)max_tokens * embd_dim);
+    token_ids.reserve(max_tokens);
+    positions.reserve(max_tokens);
+    clear();
+}
+
+void OuroborosBuffer::clear() {
+    embeddings.clear();
+    token_ids.clear();
+    positions.clear();
+    n_stored = 0;
+}
+
+void OuroborosBuffer::store(int token_id, int position, const float* hidden_state) {
+    if (hidden_state == nullptr || n_embd <= 0) return;
+
+    // Append to flat buffer
+    embeddings.insert(embeddings.end(), hidden_state, hidden_state + n_embd);
+    token_ids.push_back(token_id);
+    positions.push_back(position);
+    n_stored++;
+}
+
+const float* OuroborosBuffer::get(int index) const {
+    if (index < 0 || index >= n_stored || n_embd <= 0) return nullptr;
+    return embeddings.data() + (size_t)index * n_embd;
+}
+
+int OuroborosBuffer::find_by_position(int position) const {
+    for (int i = 0; i < n_stored; i++) {
+        if (positions[i] == position) return i;
+    }
+    return -1;
+}
+
+// Global ouroboros buffer instance
+OuroborosBuffer g_ouroboros_buffer;
+
+// Ouroboros API implementations
+void ouroboros_init(int n_embd, int max_tokens) {
+    g_ouroboros_buffer.init(n_embd, max_tokens);
+    fprintf(stderr, "Ouroboros buffer initialized: n_embd=%d, max_tokens=%d\n", n_embd, max_tokens);
+}
+
+void ouroboros_clear() {
+    g_ouroboros_buffer.clear();
+}
+
+void ouroboros_store_from_generation() {
+    // Store all hidden states from the last generation into ouroboros buffer
+    // This is called after generation completes
+    for (const auto& tok : generated_tokens) {
+        if (tok.has_hidden_state && tok.n_embd > 0) {
+            // Initialize buffer if needed
+            if (g_ouroboros_buffer.n_embd == 0) {
+                g_ouroboros_buffer.init(tok.n_embd, 8192);  // Default max
+            }
+            // Store the hidden state
+            // Position is the index in the generation + offset of generation start
+            g_ouroboros_buffer.store(tok.token_id, g_ouroboros_buffer.n_stored, tok.hidden_state_data.data());
+        }
+    }
+}
+
+int ouroboros_get_count() {
+    return g_ouroboros_buffer.n_stored;
+}
+
+const float* ouroboros_get_embedding(int index) {
+    return g_ouroboros_buffer.get(index);
+}
+
+int ouroboros_get_token_id(int index) {
+    if (index < 0 || index >= g_ouroboros_buffer.n_stored) return -1;
+    return g_ouroboros_buffer.token_ids[index];
+}
+
+int ouroboros_get_position(int index) {
+    if (index < 0 || index >= g_ouroboros_buffer.n_stored) return -1;
+    return g_ouroboros_buffer.positions[index];
+}
+
+int ouroboros_get_n_embd() {
+    return g_ouroboros_buffer.n_embd;
+}
 
 //const
 const int extra_context_handle_fragmentation = 128;
@@ -255,88 +390,176 @@ struct PendingAttentionTensor {
     int layer_idx;
 };
 static std::vector<PendingAttentionTensor> g_pending_attentions;
+static int g_graph_build_count = 0;  // Track how many times graph is built
+static int g_extraction_count = 0;   // Track extraction calls
 
 // Callback to capture attention tensor pointers during graph construction
-// NOTE: Tensors don't have data yet at this point - we just store pointers
-// UNCONDITIONAL - Always capture when kq_soft_max is seen
+// NOTE: With the CUDA tap approach, this callback is no longer the primary extraction path.
+// The tap captures attention directly in the softmax kernel, bypassing ggml's buffer aliasing.
+// This callback is kept for potential non-CUDA fallback or debugging.
 void attention_capture_callback(const llama_ubatch & ubatch,
                                 ggml_tensor * cur,
                                 const char * name,
                                 int il) {
-    // Only capture softmax attention tensors (no enabled check)
+    (void)ubatch;  // Unused with tap approach
+
+    // Only capture softmax attention tensors
     if (strcmp(name, "kq_soft_max") != 0) {
         return;
     }
 
-    // Tensor shape: [seq_len_k, seq_len_q, n_heads, batch]
-    // During generation: [seq_len_k, 1, n_heads, 1]
-    int64_t seq_len_q = cur->ne[1];  // Query length (typically 1 during generation)
-    int64_t batch = cur->ne[3];      // Batch size (typically 1)
-
-    // Only handle single-token generation
-    if (seq_len_q != 1 || batch != 1) {
-        return;
-    }
-
-    // Clear stale pointers when a NEW graph is being built (layer 0 = start of build)
-    // When graph is REUSED, this callback doesn't fire, so old pointers remain valid
+    // With CUDA tap, extraction happens in softmax kernel - no tensor storage needed
+    // Keep minimal tracking for debugging
     if (il == 0) {
         g_pending_attentions.clear();
+        g_graph_build_count++;
     }
-
-    // Store the tensor pointer for later extraction (after graph execution)
     g_pending_attentions.push_back({cur, il});
 }
 
 
-// Extract attention data from stored tensor pointers after graph execution
-// Call this AFTER graph_compute() returns, when tensor buffers are populated
-// UNCONDITIONAL - Always extract if there are pending tensors
+// Extract attention data from CUDA tap buffer (side-channel capture)
 //
-// Uses ggml_backend_tensor_get (synchronous) - same mechanism as logits transfer
+// The tap buffer captures attention during kernel execution, bypassing ggml's
+// buffer aliasing. Data is already on CPU after attention_tap_extract() call.
 //
-// NOTE: We do NOT clear g_pending_attentions here. When graph is REUSED,
-// the callback doesn't fire, but the same tensor pointers are still valid.
-// Clearing happens in the callback when a NEW graph is built (at layer 0).
-void extract_pending_attention_data() {
-    if (g_pending_attentions.empty()) {
-        return;  // Nothing to extract (shouldn't happen after first token)
-    }
+// Call this AFTER graph_compute() returns and GPU has synchronized.
+void extract_pending_attention_data(ggml_cgraph * gf) {
+    (void)gf;  // Graph parameter kept for API compatibility but not used
 
+    g_extraction_count++;
     g_attention.reset();
 
-    // Only extract last tensor (layer 27 - only one with valid data due to ggml buffer aliasing)
-    const auto & pending = g_pending_attentions.back();
-    ggml_tensor * cur = pending.tensor;
+    // FIRST: Update brightness on GPU, then copy to host
+    // Uses default stream (0) which serializes with compute
+    attention_tap_update_brightness(nullptr);
 
-    if (cur->buffer == nullptr) {
-        return;  // Buffer not allocated, try again next token
+    // Copy brightness from GPU to host (async on default stream)
+    brightness_request_readback(nullptr);
+
+    // Extract from CUDA tap buffer (GPU→CPU copy happens inside)
+    float * tap_data = nullptr;
+    int n_layers = 0;
+    int n_heads = 0;
+    int seq_len = 0;
+
+    if (!attention_tap_extract(&tap_data, &n_layers, &n_heads, &seq_len)) {
+        // No attention data captured (non-CUDA build, prompt processing, or not initialized)
+        return;
     }
 
-    int64_t seq_len_k = cur->ne[0];  // KV cache length (context)
-    int64_t n_heads = cur->ne[2];    // Number of attention heads
-    size_t tensor_bytes = seq_len_k * n_heads * sizeof(float);
+    if (n_layers == 0 || tap_data == nullptr) {
+        return;
+    }
 
-    // Use static buffers to avoid malloc/free per token
-    static std::vector<float> tensor_data;
-    static std::vector<float> transposed;
-    tensor_data.resize(seq_len_k * n_heads);
-    transposed.resize(seq_len_k * n_heads);
+    // Debug: log extraction summary
+    fprintf(stderr, "[ATTN_TAP] Extraction #%d: %d layers, %d heads, %d ctx\n",
+            g_extraction_count, n_layers, n_heads, seq_len);
 
-    // Synchronous GPU→CPU copy via ggml backend (same path as logits - works reliably)
-    ggml_backend_tensor_get(cur, tensor_data.data(), 0, tensor_bytes);
+    // Get max dimensions from tap buffer (for stride calculation)
+    // The tap buffer uses fixed strides based on max dimensions allocated at init
+    // Layout: [layer][head][ctx] where ctx is contiguous
+    int max_heads = g_attention.max_heads;
+    int max_ctx = g_attention.max_ctx;
 
-    // Transpose [seq_len, n_heads] → [n_heads, seq_len]
-    for (int h = 0; h < n_heads; h++) {
-        for (int k = 0; k < seq_len_k; k++) {
-            transposed[h * seq_len_k + k] = tensor_data[k + h * seq_len_k];
+    // Copy each layer's data to g_attention buffer
+    for (int il = 0; il < n_layers; il++) {
+        // Calculate offset into tap buffer
+        // Tap buffer layout: layer * (max_heads * max_ctx) + head * max_ctx + ctx
+        float * layer_data = tap_data + (size_t)il * max_heads * max_ctx;
+
+        // Debug: print first few values from first and last layers
+        if (il == 0 || il == n_layers - 1) {
+            fprintf(stderr, "[ATTN_TAP] Layer %d data (first 5): [%.4f, %.4f, %.4f, %.4f, %.4f]\n",
+                    il, layer_data[0], layer_data[1], layer_data[2], layer_data[3], layer_data[4]);
         }
+
+        // Note: tap buffer may have padding (max_ctx vs actual seq_len)
+        // append_layer handles the actual seq_len dimension
+        g_attention.append_layer(layer_data, n_heads, seq_len);
     }
 
-    g_attention.append_layer(transposed.data(), n_heads, seq_len_k);
-
-    // NOTE: Do NOT clear g_pending_attentions - tensor pointers are reused when graph is reused
+    fprintf(stderr, "[ATTN_TAP] Stored %d layers in g_attention buffer\n", n_layers);
 }
+
+// ============================================================================
+// BRIGHTNESS API WRAPPERS: Callable from expose.cpp (avoids ODR issues)
+// ============================================================================
+
+// These wrappers solve the ODR problem where expose.cpp is compiled once
+// without GGML_USE_CUDA, but gpttype_adapter_cublas.o is compiled with it.
+// Expose.cpp calls these wrappers, which call the real brightness functions.
+
+bool brightness_wrapper_get_data(const float ** out_data, int * out_len) {
+    return brightness_get_data(out_data, out_len);
+}
+
+int brightness_wrapper_get_sink_pos() {
+    return brightness_get_sink_pos();
+}
+
+// ============================================================================
+// TOKEN EMBEDDING LOOKUP: Direct access to tok_embd for hybrid ouroboros
+// ============================================================================
+
+// Get the input embedding for a token by reading directly from tok_embd tensor
+// This allows us to build hybrid batches with some positions using injected
+// embeddings and others using standard token lookups
+// Handles both float and quantized tensor types
+static bool get_token_embedding_from_model(llama_token token_id, float* out_embedding) {
+    if (llama_ctx_v4 == nullptr) {
+        return false;
+    }
+
+    const llama_model* model = llama_get_model(llama_ctx_v4);
+    if (model == nullptr || model->tok_embd == nullptr) {
+        return false;
+    }
+
+    ggml_tensor* tok_embd = model->tok_embd;
+    int64_t n_embd = tok_embd->ne[0];  // First dimension is embedding size
+    int64_t n_vocab = tok_embd->ne[1]; // Second dimension is vocab size
+
+    if (token_id < 0 || token_id >= n_vocab || out_embedding == nullptr) {
+        return false;
+    }
+
+    // Get tensor type and row stride
+    ggml_type type = tok_embd->type;
+    size_t row_size = tok_embd->nb[1];  // Bytes per row (handles quantization)
+
+    // Calculate offset to this token's row
+    size_t offset = (size_t)token_id * row_size;
+
+    if (type == GGML_TYPE_F32) {
+        // Float tensor - direct copy
+        ggml_backend_tensor_get(tok_embd, out_embedding, offset, n_embd * sizeof(float));
+    } else if (type == GGML_TYPE_F16) {
+        // Half-precision - read and convert
+        std::vector<ggml_fp16_t> tmp(n_embd);
+        ggml_backend_tensor_get(tok_embd, tmp.data(), offset, n_embd * sizeof(ggml_fp16_t));
+        for (int64_t i = 0; i < n_embd; i++) {
+            out_embedding[i] = ggml_fp16_to_fp32(tmp[i]);
+        }
+    } else {
+        // Quantized tensor - read raw bytes and dequantize
+        const ggml_type_traits* traits = ggml_get_type_traits(type);
+        if (traits == nullptr || traits->to_float == nullptr) {
+            printf("\n[Ouroboros] ERROR: Unsupported tok_embd type %d\n", type);
+            return false;
+        }
+
+        // Read raw quantized data
+        std::vector<uint8_t> raw_data(row_size);
+        ggml_backend_tensor_get(tok_embd, raw_data.data(), offset, row_size);
+
+        // Dequantize to float
+        traits->to_float(raw_data.data(), out_embedding, n_embd);
+    }
+
+    return true;
+}
+
 static std::map<int,std::vector<int>> antislop_banned_token_ids; //first is the npast position, second is the array of banned ids at that index
 
 const int savestate_limit = 3;
@@ -2781,6 +3004,12 @@ ModelLoadResult gpttype_load_model(const load_model_inputs inputs, FileFormat in
                    (g_attention.buffer_capacity * sizeof(float)) / (1024.0 * 1024.0));
         }
 
+        // Initialize CUDA attention tap (side-channel for multi-layer extraction)
+        attention_tap_init(n_layer, n_head, n_ctx_max);
+
+        // Initialize brightness engine (GPU-side token importance scoring)
+        brightness_init(n_ctx_max);
+
         return ModelLoadResult::SUCCESS;
     }
     else if (file_format == FileFormat::RWKV_1 || file_format==FileFormat::RWKV_2)
@@ -3482,6 +3711,7 @@ generation_outputs gpttype_generate(const generation_inputs inputs)
 
     // Reset attention capture buffer (extraction is always-on)
     g_attention.reset();
+    attention_tap_reset();  // Reset CUDA tap buffer for new token
 
     // Enable hidden state extraction if requested
     g_output_hidden_states = inputs.output_hidden_states;
@@ -4260,8 +4490,75 @@ generation_outputs gpttype_generate(const generation_inputs inputs)
                 if(embd.size()!=1 || draft_ctx==nullptr || remaining_tokens<=speculative_chunk_amt || grammar!=nullptr || startedsampling==false) //for large batch, or if no draft model, PP/TG as usual
                 {
                     draft_used = false;
-                    kcpp_embd_batch batch = kcpp_embd_batch(embd, n_past, use_mrope, false);
-                    int32_t decode_status = llama_decode(llama_ctx_v4, batch.batch);
+
+                    // OUROBOROS MODE: Build hybrid embedding array
+                    // For each position: use injected embedding if available, else lookup from tok_embd
+                    bool use_ouroboros_injection = false;
+                    std::vector<float> hybrid_embd_buffer;
+                    int n_embd_model = 0;
+
+                    if (inputs.ouroboros_mode && inputs.ouroboros_embeddings != nullptr &&
+                        inputs.ouroboros_embd_count > 0 && inputs.ouroboros_positions != nullptr &&
+                        embd.size() > 0) {
+
+                        // Get model embedding dimension
+                        const llama_model* model = llama_get_model(llama_ctx_v4);
+                        n_embd_model = llama_model_n_embd(model);
+
+                        // Build position → embedding index map for O(1) lookup
+                        std::map<int32_t, int> pos_to_idx;
+                        for (int i = 0; i < inputs.ouroboros_embd_count; i++) {
+                            pos_to_idx[inputs.ouroboros_positions[i]] = i;
+                        }
+
+                        // Build hybrid embedding array: injected where available, tok_embd lookup otherwise
+                        hybrid_embd_buffer.resize(embd.size() * n_embd_model);
+                        int injected_count = 0;
+                        int lookup_count = 0;
+
+                        for (size_t i = 0; i < embd.size(); i++) {
+                            int pos = n_past + i;
+                            float* dest = hybrid_embd_buffer.data() + i * n_embd_model;
+
+                            auto it = pos_to_idx.find(pos);
+                            if (it != pos_to_idx.end()) {
+                                // Position has injected embedding - use it
+                                memcpy(dest,
+                                       inputs.ouroboros_embeddings + it->second * n_embd_model,
+                                       n_embd_model * sizeof(float));
+                                injected_count++;
+                            } else {
+                                // Position has no injection - lookup from tok_embd
+                                if (!get_token_embedding_from_model(embd[i], dest)) {
+                                    // Fallback: if lookup fails, zero the embedding (shouldn't happen)
+                                    memset(dest, 0, n_embd_model * sizeof(float));
+                                    printf("\n[Ouroboros] WARNING: tok_embd lookup failed for token %d\n", embd[i]);
+                                }
+                                lookup_count++;
+                            }
+                        }
+
+                        use_ouroboros_injection = true;
+
+                        // Debug output
+                        printf("\n[Ouroboros] HYBRID batch [%d-%d]: %d injected, %d looked up\n",
+                               n_past, n_past + (int)embd.size() - 1, injected_count, lookup_count);
+                    }
+
+                    int32_t decode_status;
+                    // Keep a pointer to the batch for potential draft_ctx use
+                    std::unique_ptr<kcpp_embd_batch> batch_ptr;
+
+                    if (use_ouroboros_injection) {
+                        // Use embedding path with our hybrid array
+                        batch_ptr = std::make_unique<kcpp_embd_batch>(hybrid_embd_buffer.data(),
+                                                                       embd.size(), n_past, use_mrope);
+                        decode_status = llama_decode(llama_ctx_v4, batch_ptr->batch);
+                    } else {
+                        // Normal token path (ouroboros not enabled)
+                        batch_ptr = std::make_unique<kcpp_embd_batch>(embd, n_past, use_mrope, false);
+                        decode_status = llama_decode(llama_ctx_v4, batch_ptr->batch);
+                    }
                     if(decode_status==1 && embd.size()>128)
                     {
                         printf("Couldn't find a big KV slot. Retry with smaller batch size of 128...\n");
@@ -4305,9 +4602,9 @@ generation_outputs gpttype_generate(const generation_inputs inputs)
                         }
                     }
 
-                    if(draft_ctx)
+                    if(draft_ctx && batch_ptr)
                     {
-                        evalres = (evalres && (llama_decode(draft_ctx, batch.batch)==0));
+                        evalres = (evalres && (llama_decode(draft_ctx, batch_ptr->batch)==0));
                     }
                 } else { //individual tokens AND speculative is used (generation)
                     draft_used = true;

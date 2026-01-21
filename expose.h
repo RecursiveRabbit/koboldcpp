@@ -135,6 +135,16 @@ struct generation_inputs
     const bool output_hidden_states = false;
     const int input_ids_len = 0;
     const int32_t * input_ids = nullptr;
+    // Ouroboros mode: feed back hidden states instead of doing embedding lookups
+    // for model-generated tokens. Preserves continuous representation through turns.
+    const bool ouroboros_mode = false;
+    // If non-null, these embeddings will be injected at the specified positions
+    // instead of doing embedding lookups. Shape: [ouroboros_embd_count, n_embd]
+    const float * ouroboros_embeddings = nullptr;
+    const int ouroboros_embd_count = 0;
+    // Positions in the input where ouroboros embeddings should be injected
+    // (indices into input_ids array where we use embeddings instead of token lookup)
+    const int32_t * ouroboros_positions = nullptr;
 };
 struct generation_outputs
 {
@@ -157,12 +167,36 @@ struct attention_outputs
     bool valid = false;  // True if attention data is available
 };
 
+struct brightness_outputs
+{
+    const float * data = nullptr;  // Pointer to brightness buffer [ctx_len]
+    int ctx_len = 0;               // Current context length
+    int sink_pos = -1;             // Detected attention sink position
+    bool valid = false;            // True if brightness data is available
+};
+
 struct hidden_state_outputs
 {
     const float * data = nullptr;  // Pointer to hidden state buffer [n_embd]
     int n_embd = 0;                // Hidden dimension (e.g., 3584 for Qwen2.5-7B)
     int token_position = -1;       // Position in sequence this hidden state is for
     bool valid = false;            // True if hidden state data is available
+};
+
+// Ouroboros buffer: stores hidden states from generation for re-injection
+// This preserves the continuous representation through conversation turns
+struct OuroborosBuffer {
+    std::vector<float> embeddings;    // Flat buffer: [n_stored * n_embd]
+    std::vector<int32_t> token_ids;   // Token IDs corresponding to each stored embedding
+    std::vector<int32_t> positions;   // Original positions in the sequence
+    int n_stored = 0;                 // Number of stored embeddings
+    int n_embd = 0;                   // Embedding dimension
+
+    void init(int embd_dim, int max_tokens);
+    void clear();
+    void store(int token_id, int position, const float* hidden_state);
+    const float* get(int index) const;
+    int find_by_position(int position) const;
 };
 
 // Forward declarations for attention capture system
@@ -173,6 +207,10 @@ struct AttentionCapture {
     int n_layers_captured = 0;
     int n_heads = 0;
     int seq_len = 0;
+    // Max dimensions (stored at init for stride calculations)
+    int max_heads = 0;
+    int max_ctx = 0;
+    int max_layers = 0;
     // NO ENABLED FLAG - Unconditional extraction for all tokens
 
     void init(int max_heads, int max_ctx, int max_layers);
@@ -401,3 +439,14 @@ extern int total_transcribe_gens;
 extern int last_draft_success;
 extern int last_draft_failed;
 extern stop_reason last_stop_reason;
+extern OuroborosBuffer g_ouroboros_buffer;
+
+// Ouroboros API functions
+void ouroboros_init(int n_embd, int max_tokens);
+void ouroboros_clear();
+void ouroboros_store_from_generation();  // Store all hidden states from last generation
+int ouroboros_get_count();
+const float* ouroboros_get_embedding(int index);
+int ouroboros_get_token_id(int index);
+int ouroboros_get_position(int index);
+int ouroboros_get_n_embd();

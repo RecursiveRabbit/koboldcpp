@@ -1,8 +1,173 @@
 #include "common.cuh"
 #include "ggml.h"
 #include "softmax.cuh"
+#include "brightness.cuh"
 #include <cstdint>
 #include <utility>
+#include <cstring>
+#include <mutex>
+
+// =============================================================================
+// ATTENTION TAP INFRASTRUCTURE
+// Side-channel buffer for capturing attention data during kernel execution.
+// Invisible to ggml's allocator - lives outside the compute graph.
+// =============================================================================
+
+struct attention_tap_state {
+    float * buffer;           // GPU buffer: [max_layers, max_heads, max_ctx]
+    float * host_buffer;      // CPU staging buffer for extraction
+    int max_layers;
+    int max_heads;
+    int max_ctx;
+    int current_ctx;          // Actual context length for current token
+    int n_layers_captured;    // Number of layers written this token
+    bool enabled;
+    std::mutex mtx;
+};
+
+static attention_tap_state g_attn_tap = {};
+
+void attention_tap_init(int max_layers, int max_heads, int max_ctx) {
+    std::lock_guard<std::mutex> lock(g_attn_tap.mtx);
+
+    if (g_attn_tap.buffer != nullptr) {
+        return;  // Already initialized
+    }
+
+    size_t buffer_size = (size_t)max_layers * max_heads * max_ctx * sizeof(float);
+
+    cudaError_t err = cudaMalloc(&g_attn_tap.buffer, buffer_size);
+    if (err != cudaSuccess) {
+        fprintf(stderr, "[ATTN_TAP] Failed to allocate GPU buffer: %s\n", cudaGetErrorString(err));
+        return;
+    }
+
+    g_attn_tap.host_buffer = (float *)malloc(buffer_size);
+    if (g_attn_tap.host_buffer == nullptr) {
+        cudaFree(g_attn_tap.buffer);
+        g_attn_tap.buffer = nullptr;
+        fprintf(stderr, "[ATTN_TAP] Failed to allocate host buffer\n");
+        return;
+    }
+
+    g_attn_tap.max_layers = max_layers;
+    g_attn_tap.max_heads = max_heads;
+    g_attn_tap.max_ctx = max_ctx;
+    g_attn_tap.current_ctx = 0;
+    g_attn_tap.n_layers_captured = 0;
+    g_attn_tap.enabled = true;
+
+    fprintf(stderr, "[ATTN_TAP] Initialized: %d layers, %d heads, %d max_ctx (%.2f MB GPU)\n",
+            max_layers, max_heads, max_ctx, buffer_size / (1024.0f * 1024.0f));
+}
+
+void attention_tap_free() {
+    std::lock_guard<std::mutex> lock(g_attn_tap.mtx);
+
+    if (g_attn_tap.buffer != nullptr) {
+        cudaFree(g_attn_tap.buffer);
+        g_attn_tap.buffer = nullptr;
+    }
+    if (g_attn_tap.host_buffer != nullptr) {
+        free(g_attn_tap.host_buffer);
+        g_attn_tap.host_buffer = nullptr;
+    }
+    g_attn_tap.enabled = false;
+}
+
+void attention_tap_reset() {
+    // Called at start of each token generation
+    g_attn_tap.n_layers_captured = 0;
+    g_attn_tap.current_ctx = 0;
+}
+
+// Returns pointer into GPU buffer for a specific layer
+static float * attention_tap_get_layer_ptr(int layer, int n_heads, int seq_len) {
+    if (!g_attn_tap.enabled || g_attn_tap.buffer == nullptr) {
+        return nullptr;
+    }
+    if (layer >= g_attn_tap.max_layers || n_heads > g_attn_tap.max_heads || seq_len > g_attn_tap.max_ctx) {
+        return nullptr;
+    }
+
+    // Update context length (should be same for all layers)
+    g_attn_tap.current_ctx = seq_len;
+
+    // Layout: [layer, head, ctx]
+    size_t offset = (size_t)layer * g_attn_tap.max_heads * g_attn_tap.max_ctx;
+    return g_attn_tap.buffer + offset;
+}
+
+static void attention_tap_layer_complete(int layer) {
+    if (layer >= g_attn_tap.n_layers_captured) {
+        g_attn_tap.n_layers_captured = layer + 1;
+    }
+}
+
+// Extract all captured attention to host memory
+bool attention_tap_extract(float ** out_data, int * out_n_layers, int * out_n_heads, int * out_seq_len) {
+    if (!g_attn_tap.enabled || g_attn_tap.n_layers_captured == 0) {
+        return false;
+    }
+
+    int n_layers = g_attn_tap.n_layers_captured;
+    int n_heads = g_attn_tap.max_heads;
+    int seq_len = g_attn_tap.current_ctx;
+
+    // Copy from GPU to host - only the data we actually captured
+    // We copy full max_heads * max_ctx per layer for simplicity
+    size_t bytes_per_layer = (size_t)g_attn_tap.max_heads * g_attn_tap.max_ctx * sizeof(float);
+
+    cudaError_t err = cudaMemcpy(g_attn_tap.host_buffer, g_attn_tap.buffer,
+                                  bytes_per_layer * n_layers, cudaMemcpyDeviceToHost);
+    if (err != cudaSuccess) {
+        fprintf(stderr, "[ATTN_TAP] Extract failed: %s\n", cudaGetErrorString(err));
+        return false;
+    }
+
+    *out_data = g_attn_tap.host_buffer;
+    *out_n_layers = n_layers;
+    *out_n_heads = n_heads;
+    *out_seq_len = seq_len;
+
+    return true;
+}
+
+// Get raw GPU buffer for brightness calculation (no CPU copy)
+bool attention_tap_get_gpu_data(float ** out_buffer, int * out_n_layers, int * out_n_heads, int * out_seq_len, int * out_max_ctx) {
+    if (!g_attn_tap.enabled || g_attn_tap.n_layers_captured == 0) {
+        return false;
+    }
+
+    *out_buffer = g_attn_tap.buffer;
+    *out_n_layers = g_attn_tap.n_layers_captured;
+    *out_n_heads = g_attn_tap.max_heads;
+    *out_seq_len = g_attn_tap.current_ctx;
+    *out_max_ctx = g_attn_tap.max_ctx;
+
+    return true;
+}
+
+// Update brightness using GPU tap buffer (call after all layers captured)
+// Takes void* for ABI compatibility with non-CUDA callers (cast to cudaStream_t internally)
+void attention_tap_update_brightness(void * stream_ptr) {
+    float * buffer;
+    int n_layers, n_heads, seq_len, max_ctx;
+
+    if (!attention_tap_get_gpu_data(&buffer, &n_layers, &n_heads, &seq_len, &max_ctx)) {
+        return;
+    }
+
+    // Cast void* to cudaStream_t (nullptr = default stream)
+    cudaStream_t stream = static_cast<cudaStream_t>(stream_ptr);
+
+    // Call brightness engine with GPU attention data
+    brightness_update(buffer, seq_len, n_layers, n_heads, max_ctx, stream);
+}
+
+// =============================================================================
+// END ATTENTION TAP INFRASTRUCTURE
+// =============================================================================
 
 template <typename T>
 static __device__ __forceinline__ float t2f32(T val) {
@@ -318,6 +483,30 @@ void ggml_cuda_op_soft_max(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
         soft_max_f32_cuda(src0_d, (const half  *) src1_d, (const float *) src2_d, dst_d, params, stream);
     } else {
         soft_max_f32_cuda(src0_d, (const float *) src1_d, (const float *) src2_d, dst_d, params, stream);
+    }
+
+    // =========================================================================
+    // ATTENTION TAP: Copy attention data to side-channel buffer
+    // This happens immediately after kernel on same stream, before buffer reuse
+    // =========================================================================
+    if (dst->name && strncmp(dst->name, "kq_soft_max-", 12) == 0) {
+        // Only tap single-token generation (ne01 == 1), not prompt processing
+        if (params.ne01 == 1) {
+            // Extract layer index from name "kq_soft_max-N"
+            int layer = atoi(dst->name + 12);
+
+            int n_heads = (int)params.ne02;
+            int seq_len = (int)params.ne00;
+
+            float * tap_ptr = attention_tap_get_layer_ptr(layer, n_heads, seq_len);
+            if (tap_ptr != nullptr) {
+                // Async copy on same stream - will complete before any subsequent kernel
+                // that might reuse dst_d buffer
+                size_t bytes = (size_t)n_heads * seq_len * sizeof(float);
+                cudaMemcpyAsync(tap_ptr, dst_d, bytes, cudaMemcpyDeviceToDevice, stream);
+                attention_tap_layer_complete(layer);
+            }
+        }
     }
 }
 

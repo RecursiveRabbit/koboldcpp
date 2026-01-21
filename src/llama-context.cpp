@@ -788,6 +788,10 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         //LLAMA_LOG_INFO("graph set inputs time: %.3f ms\n", (ggml_time_us() - t_start_us)/1000.0);
     }
 
+    // Reset attention tap buffer before forward pass (for multi-layer capture)
+    extern void attention_tap_reset();
+    attention_tap_reset();
+
     const auto status = graph_compute(res->get_gf(), ubatch.n_tokens > 1);
     if (status != GGML_STATUS_SUCCESS) {
         LLAMA_LOG_ERROR("%s: failed to compute graph, compute status: %d\n", __func__, status);
@@ -802,8 +806,9 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
 
     // UNCONDITIONAL ATTENTION EXTRACTION HOOK (after GPU sync)
     // Called after every graph compute - cannot be bypassed
-    extern void extract_pending_attention_data();
-    extract_pending_attention_data();
+    // Pass the actual executed graph so tensors can be looked up by name
+    extern void extract_pending_attention_data(ggml_cgraph * gf);
+    extract_pending_attention_data(gf);
 
     ret = GGML_STATUS_SUCCESS;
 

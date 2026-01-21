@@ -20,6 +20,11 @@
 #include "expose.h"
 #include "model_adapter.cpp"
 
+// Brightness engine wrappers (defined in gpttype_adapter.cpp)
+// These avoid ODR issues by routing through the cublas-compiled gpttype_adapter
+extern bool brightness_wrapper_get_data(const float ** out_data, int * out_len);
+extern int brightness_wrapper_get_sink_pos();
+
 extern "C"
 {
 
@@ -284,6 +289,30 @@ extern "C"
         return output;
     }
 
+    brightness_outputs get_brightness()
+    {
+        brightness_outputs output;
+
+        const float * data = nullptr;
+        int ctx_len = 0;
+
+        bool success = brightness_wrapper_get_data(&data, &ctx_len);
+
+        if (success) {
+            output.data = data;
+            output.ctx_len = ctx_len;
+            output.sink_pos = brightness_wrapper_get_sink_pos();
+            output.valid = true;
+        } else {
+            output.data = nullptr;
+            output.ctx_len = 0;
+            output.sink_pos = -1;
+            output.valid = false;
+        }
+
+        return output;
+    }
+
     bool sd_load_model(const sd_load_model_inputs inputs)
     {
         return sdtype_load_model(inputs);
@@ -491,5 +520,49 @@ extern "C"
     model_info_outputs get_model_info()
     {
         return gpttype_get_model_info();
+    }
+
+    // ============================================================================
+    // OUROBOROS API: Continuous representation preservation
+    // ============================================================================
+
+    void ouroboros_init_buffer(int n_embd, int max_tokens)
+    {
+        ouroboros_init(n_embd, max_tokens);
+    }
+
+    void ouroboros_clear_buffer()
+    {
+        ouroboros_clear();
+    }
+
+    void ouroboros_store_generation()
+    {
+        ouroboros_store_from_generation();
+    }
+
+    int ouroboros_count()
+    {
+        return ouroboros_get_count();
+    }
+
+    const float* ouroboros_embedding(int index)
+    {
+        return ouroboros_get_embedding(index);
+    }
+
+    int ouroboros_token_id(int index)
+    {
+        return ouroboros_get_token_id(index);
+    }
+
+    int ouroboros_position(int index)
+    {
+        return ouroboros_get_position(index);
+    }
+
+    int ouroboros_n_embd()
+    {
+        return ouroboros_get_n_embd();
     }
 }
