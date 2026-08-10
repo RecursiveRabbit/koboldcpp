@@ -142,3 +142,12 @@ size_t gpttype_calc_old_state_tokencount(int slot);
 size_t gpttype_save_state_kv(int slot);
 bool gpttype_load_state_kv(int slot);
 bool gpttype_clear_state_kv(bool shrink);
+// EPIC/Halo Weave: KV Cache Export for Position-Independent Caching
+bool gpttype_prefill_and_export_kv(const char* text, const char* output_path, bool add_bos);
+bool gpttype_load_kv_from_file(const char* input_path);
+
+// EPIC Position Remapping - RoPE-aware KV cache operations (Halo Weave)
+bool gpttype_import_kv_with_position_remap(const char* input_path, int target_position);
+void gpttype_get_kv_position_info(int* pos_min, int* pos_max, int* used_cells);
+bool gpttype_apply_kv_position_shift(int pos_start, int pos_end, int delta);
+bool gpttype_can_shift_kv();

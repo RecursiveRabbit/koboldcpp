@@ -5424,3 +5424,279 @@ bool gpttype_clear_state_kv(bool shrink)
     }
     return false;
 }
+
+// ============================================================================
+// EPIC/Halo Weave: KV Cache Export for Position-Independent Caching
+// ============================================================================
+
+bool gpttype_prefill_and_export_kv(const char* text, const char* output_path, bool add_bos)
+{
+    if(kcpp_data == nullptr || llama_ctx_v4 == nullptr)
+    {
+        fprintf(stderr, "EPIC Export: Model not loaded\n");
+        return false;
+    }
+    
+    if(file_format != FileFormat::GGUF_GENERIC)
+    {
+        fprintf(stderr, "EPIC Export: Only GGUF models are supported\n");
+        return false;
+    }
+    
+    // 1. Tokenize the input text
+    std::vector<int> tokens;
+    std::string input_text = text;
+    TokenizeString(input_text, tokens, file_format, add_bos);
+    
+    if(tokens.empty())
+    {
+        fprintf(stderr, "EPIC Export: Tokenization produced empty result\n");
+        return false;
+    }
+    
+    printf("EPIC Export: Tokenized %zu tokens from input text\n", tokens.size());
+    
+    // 2. Clear the KV cache
+    llama_memory_clear(llama_get_memory(llama_ctx_v4), true);
+    
+    // 3. Process tokens in batches (prefill)
+    int batch_size = kcpp_data->n_batch;
+    int n_tokens = tokens.size();
+    int processed = 0;
+    
+    while(processed < n_tokens)
+    {
+        int batch_tokens = std::min(batch_size, n_tokens - processed);
+        
+        // Create batch for this chunk
+        llama_batch batch = llama_batch_get_one(tokens.data() + processed, batch_tokens);
+        
+        // Set positions correctly for prefill
+        for(int i = 0; i < batch_tokens; i++)
+        {
+            batch.pos[i] = processed + i;
+        }
+        
+        int result = llama_decode(llama_ctx_v4, batch);
+        if(result != 0)
+        {
+            fprintf(stderr, "EPIC Export: llama_decode failed with code %d at position %d\n", result, processed);
+            return false;
+        }
+        
+        processed += batch_tokens;
+        printf("EPIC Export: Processed %d/%d tokens\n", processed, n_tokens);
+    }
+    
+    // 4. Save the KV cache state to file
+    // Cast tokens to llama_token (they should be compatible)
+    std::vector<llama_token> llama_tokens(tokens.begin(), tokens.end());
+    
+    bool save_result = llama_state_save_file(
+        llama_ctx_v4,
+        output_path,
+        llama_tokens.data(),
+        llama_tokens.size()
+    );
+    
+    if(!save_result)
+    {
+        fprintf(stderr, "EPIC Export: Failed to save state to %s\n", output_path);
+        return false;
+    }
+    
+    // Get file size for reporting
+    size_t state_size = llama_state_get_size(llama_ctx_v4);
+    printf("EPIC Export: Successfully saved KV cache to %s (approx %.2f MB)\n", 
+           output_path, state_size / (1024.0 * 1024.0));
+    
+    return true;
+}
+
+// Load a previously exported KV cache from file
+bool gpttype_load_kv_from_file(const char* input_path)
+{
+    if(kcpp_data == nullptr || llama_ctx_v4 == nullptr)
+    {
+        fprintf(stderr, "EPIC Load: Model not loaded\n");
+        return false;
+    }
+    
+    if(file_format != FileFormat::GGUF_GENERIC)
+    {
+        fprintf(stderr, "EPIC Load: Only GGUF models are supported\n");
+        return false;
+    }
+    
+    // Allocate buffer for loaded tokens
+    size_t max_tokens = kcpp_data->n_ctx;
+    std::vector<llama_token> loaded_tokens(max_tokens);
+    size_t n_token_count = 0;
+    
+    // Clear existing KV cache
+    llama_memory_clear(llama_get_memory(llama_ctx_v4), true);
+    
+    // Load the state from file
+    bool load_result = llama_state_load_file(
+        llama_ctx_v4,
+        input_path,
+        loaded_tokens.data(),
+        max_tokens,
+        &n_token_count
+    );
+    
+    if(!load_result)
+    {
+        fprintf(stderr, "EPIC Load: Failed to load state from %s\n", input_path);
+        return false;
+    }
+    
+    // Update internal token tracking
+    current_context_tokens.clear();
+    for(size_t i = 0; i < n_token_count; i++)
+    {
+        current_context_tokens.push_back(loaded_tokens[i]);
+    }
+    n_past = n_token_count;
+    
+    printf("EPIC Load: Successfully loaded KV cache from %s (%zu tokens)\n", 
+           input_path, n_token_count);
+    
+    return true;
+}
+
+// ============================================================================
+// EPIC POSITION REMAPPING: RoPE-aware KV Cache Import (Halo Weave)
+// Enables loading KV cache chunks at arbitrary positions via K-shift mechanism
+// ============================================================================
+
+bool gpttype_import_kv_with_position_remap(const char* input_path, int target_position)
+{
+    if(kcpp_data == nullptr || llama_ctx_v4 == nullptr)
+    {
+        fprintf(stderr, "EPIC Import Remap: Model not loaded\n");
+        return false;
+    }
+    
+    if(file_format != FileFormat::GGUF_GENERIC)
+    {
+        fprintf(stderr, "EPIC Import Remap: Only GGUF models are supported\n");
+        return false;
+    }
+    
+    llama_memory_t mem = llama_get_memory(llama_ctx_v4);
+    if (!llama_memory_can_shift(mem))
+    {
+        fprintf(stderr, "EPIC Import Remap: Model does not support K-shift (required for position remapping)\n");
+        return false;
+    }
+    
+    size_t max_tokens = kcpp_data->n_ctx;
+    std::vector<llama_token> loaded_tokens(max_tokens);
+    size_t n_token_count = 0;
+    
+    bool load_result = llama_state_load_file(
+        llama_ctx_v4,
+        input_path,
+        loaded_tokens.data(),
+        max_tokens,
+        &n_token_count
+    );
+    
+    if(!load_result)
+    {
+        fprintf(stderr, "EPIC Import Remap: Failed to load state from %s\n", input_path);
+        return false;
+    }
+    
+    if(target_position >= 0)
+    {
+        llama_pos loaded_pos_min = llama_memory_seq_pos_min(mem, 0);
+        llama_pos delta = target_position - loaded_pos_min;
+        
+        if(delta != 0)
+        {
+            printf("EPIC Import Remap: Applying position shift delta=%d (from pos %d to target %d)\n",
+                   (int)delta, (int)loaded_pos_min, target_position);
+            llama_memory_seq_add(mem, 0, -1, -1, delta);
+            printf("EPIC Import Remap: Position shift applied. K-shift will be computed on next batch.\n");
+        }
+    }
+    
+    current_context_tokens.clear();
+    for(size_t i = 0; i < n_token_count; i++)
+    {
+        current_context_tokens.push_back(loaded_tokens[i]);
+    }
+    n_past = n_token_count;
+    
+    printf("EPIC Import Remap: Loaded KV from %s (%zu tokens at target position %d)\n", 
+           input_path, n_token_count, target_position);
+    
+    return true;
+}
+
+void gpttype_get_kv_position_info(int* pos_min, int* pos_max, int* used_cells)
+{
+    if(kcpp_data == nullptr || llama_ctx_v4 == nullptr)
+    {
+        if(pos_min) *pos_min = -1;
+        if(pos_max) *pos_max = -1;
+        if(used_cells) *used_cells = 0;
+        return;
+    }
+    
+    llama_memory_t mem = llama_get_memory(llama_ctx_v4);
+    if(pos_min) *pos_min = llama_memory_seq_pos_min(mem, 0);
+    if(pos_max) *pos_max = llama_memory_seq_pos_max(mem, 0);
+    if(used_cells) *used_cells = current_context_tokens.size();
+}
+
+bool gpttype_apply_kv_position_shift(int pos_start, int pos_end, int delta)
+{
+    if(kcpp_data == nullptr || llama_ctx_v4 == nullptr)
+    {
+        fprintf(stderr, "EPIC Shift: Model not loaded\n");
+        return false;
+    }
+    
+    if(file_format != FileFormat::GGUF_GENERIC)
+    {
+        fprintf(stderr, "EPIC Shift: Only GGUF models are supported\n");
+        return false;
+    }
+    
+    llama_memory_t mem = llama_get_memory(llama_ctx_v4);
+    if (!llama_memory_can_shift(mem))
+    {
+        fprintf(stderr, "EPIC Shift: Model does not support K-shift\n");
+        return false;
+    }
+    
+    if(delta == 0)
+    {
+        printf("EPIC Shift: Delta is 0, no shift applied\n");
+        return true;
+    }
+    
+    llama_memory_seq_add(mem, 0, pos_start, pos_end, delta);
+    printf("EPIC Shift: Applied delta=%d to positions [%d, %d]\n", delta, pos_start, pos_end);
+    
+    return true;
+}
+
+bool gpttype_can_shift_kv()
+{
+    if(kcpp_data == nullptr || llama_ctx_v4 == nullptr)
+    {
+        return false;
+    }
+    
+    if(file_format != FileFormat::GGUF_GENERIC)
+    {
+        return false;
+    }
+    
+    llama_memory_t mem = llama_get_memory(llama_ctx_v4);
+    return llama_memory_can_shift(mem);
+}

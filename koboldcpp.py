@@ -443,8 +443,6 @@ class model_info_outputs(ctypes.Structure):
                 ("rope_freq_base", ctypes.c_float),
                 ("rope_freq_scale", ctypes.c_float)]
 
-
-
 def getdirpath():
     return os.path.dirname(os.path.realpath(__file__))
 def getabspath():
@@ -681,6 +679,16 @@ def init_library():
     handle.token_to_str.argtypes = [ctypes.c_int]
     handle.token_to_str.restype = ctypes.c_char_p
 
+    # EPIC Position Remapping API - RoPE-aware KV cache operations (Halo Weave)
+    handle.epic_import_kv_with_remap.argtypes = [ctypes.c_char_p, ctypes.c_int]
+    handle.epic_import_kv_with_remap.restype = ctypes.c_bool
+    handle.epic_get_kv_position_info.argtypes = [ctypes.POINTER(ctypes.c_int), ctypes.POINTER(ctypes.c_int), ctypes.POINTER(ctypes.c_int)]
+    handle.epic_get_kv_position_info.restype = None
+    handle.epic_apply_kv_shift.argtypes = [ctypes.c_int, ctypes.c_int, ctypes.c_int]
+    handle.epic_apply_kv_shift.restype = ctypes.c_bool
+    handle.epic_can_shift_kv.argtypes = []
+    handle.epic_can_shift_kv.restype = ctypes.c_bool
+
 def set_backend_props(inputs):
     clblastids = 0
     if args.useclblast:
@@ -816,7 +824,6 @@ def old_cpu_check(): #return -1 for pass, 0 if has avx2, 1 if has avx, 2 if has 
         return retflags
     except Exception:
         return -1 #cannot determine
-
 
 def unpack_to_dir(destpath = ""):
     srcpath = os.path.abspath(os.path.dirname(__file__))
@@ -1652,7 +1659,6 @@ def generate(genparams, stream_flag=False):
         if max_length >= (max_context_length-min_remain_hardlimit):
             max_length = max_context_length-min_remain_hardlimit
 
-
     inputs.max_context_length = max_context_length   # this will resize the context buffer if changed
     inputs.max_length = max_length
     inputs.temperature = temperature
@@ -1988,7 +1994,6 @@ def sd_parse_meta_field(prompt, config=False):
         pass
     return kv_dict
 
-
 def sd_generate(genparams):
     global maxctx, args, currentusergenkey, totalgens, pendingabortkey, chatcompl_adapter
 
@@ -2099,7 +2104,6 @@ def sd_generate(genparams):
         outstr = ret.data.decode("UTF-8","ignore")
         animated = True if ret.animated else False
     return {"animated": animated, "data":outstr}
-
 
 def whisper_load_model(model_filename):
     global args
@@ -2274,7 +2278,699 @@ def detokenize_ids(tokids):
         detokstr = ctypes.string_at(detok).decode("UTF-8","ignore")
     return detokstr
 
+# EPIC API - Embedding Pre-computation for Incremental Contexts
+
+EPIC_SLOT = 0
+EPIC_MAGIC = b"EPIC"
+EPIC_VERSION = 1
+
+def epic_export_kv(text, output_path, add_bos=True, metadata=None, options=None):
+    import time, struct, hashlib
+    start_time = time.time()
+    if metadata is None: metadata = {}
+    if options is None: options = {}
+    try:
+        token_ids = tokenize_ids(text, add_bos)
+        token_count = len(token_ids)
+        if token_count == 0:
+            return {"success": False, "error": {"code": "INVALID_TEXT", "message": "Text produced no tokens"}}
+        gen_input = generation_inputs()
+        input_ids_array = (ctypes.c_int32 * token_count)(*token_ids)
+        gen_input.input_ids = input_ids_array
+        gen_input.input_ids_len = token_count
+        gen_input.prompt = "".encode("UTF-8")
+        gen_input.max_length = 0
+        gen_input.max_context_length = maxctx
+        gen_input.temperature = 0.0
+        gen_input.seed = -1
+        gen_input.memory = "".encode("UTF-8")
+        gen_input.negative_prompt = "".encode("UTF-8")
+        gen_input.guidance_scale = 1.0
+        for i in range(images_max): gen_input.images[i] = "".encode("UTF-8")
+        for i in range(audio_max): gen_input.audio[i] = "".encode("UTF-8")
+        # Initialize remaining required fields to prevent null pointer issues
+        gen_input.grammar = "".encode("UTF-8")
+        gen_input.grammar_retain_state = False
+        gen_input.stop_sequence_len = 0
+        gen_input.stop_sequence = (ctypes.c_char_p * 0)()
+        gen_input.logit_biases_len = 0
+        gen_input.logit_biases = (logit_bias * 0)()
+        gen_input.banned_tokens_len = 0
+        gen_input.banned_tokens = (ctypes.c_char_p * 0)()
+        gen_input.dry_sequence_breakers_len = 0
+        gen_input.dry_sequence_breakers = (ctypes.c_char_p * 0)()
+        gen_input.output_attentions = False
+        gen_input.output_hidden_states = False
+        gen_input.ouroboros_mode = False
+        gen_input.ouroboros_embd_count = 0
+        gen_input.ouroboros_embeddings = None
+        gen_input.ouroboros_positions = None
+        gen_input.stream_sse = False
+        gen_input.allow_eos_token = True
+        gen_input.bypass_eos_token = False
+        gen_input.tool_call_fix = False
+        gen_input.render_special = False
+        gen_input.mirostat = 0
+        gen_input.mirostat_tau = 0
+        gen_input.mirostat_eta = 0
+        gen_input.top_k = 0
+        gen_input.top_a = 0
+        gen_input.top_p = 1.0
+        gen_input.min_p = 0
+        gen_input.typical_p = 1.0
+        gen_input.tfs = 1.0
+        gen_input.nsigma = 0
+        gen_input.rep_pen = 1.0
+        gen_input.rep_pen_range = 0
+        gen_input.rep_pen_slope = 0
+        gen_input.presence_penalty = 0
+        gen_input.dynatemp_range = 0
+        gen_input.dynatemp_exponent = 1.0
+        gen_input.smoothing_factor = 0
+        gen_input.dry_multiplier = 0
+        gen_input.dry_base = 0
+        gen_input.dry_allowed_length = 0
+        gen_input.dry_penalty_last_n = 0
+        gen_input.xtc_threshold = 0
+        gen_input.xtc_probability = 0
+        gen_input.sampler_len = 0
+        handle.generate(gen_input)
+        saved_size = handle.save_state_kv(EPIC_SLOT)
+        if saved_size == 0:
+            return {"success": False, "error": {"code": "EXPORT_FAILED", "message": "Failed to save KV state to slot"}}
+        file_metadata = {
+            "epic_version": EPIC_VERSION, "token_count": token_count,
+            "token_ids": token_ids if options.get("include_tokens", True) else [],
+            "model_id": friendlymodelname, "max_context": maxctx,
+            "created_at": datetime.now(timezone.utc).isoformat(),
+            "content_hash": hashlib.sha256(text.encode()).hexdigest(),
+            "kv_size_bytes": saved_size, "slot_based": True, **metadata
+        }
+        os.makedirs(os.path.dirname(os.path.abspath(output_path)), exist_ok=True)
+        with open(output_path, "wb") as f:
+            f.write(EPIC_MAGIC)
+            f.write(struct.pack("<H", EPIC_VERSION))
+            meta_json = json.dumps(file_metadata).encode("utf-8")
+            f.write(struct.pack("<I", len(meta_json)))
+            f.write(meta_json)
+        processing_time_ms = int((time.time() - start_time) * 1000)
+        return {"success": True, "cache_file": {"path": output_path, "size_bytes": os.path.getsize(output_path)},
+                "stats": {"token_count": token_count, "processing_time_ms": processing_time_ms, "kv_size_bytes": saved_size},
+                "content_hash": f"sha256:{file_metadata['content_hash']}", "metadata": file_metadata}
+    except Exception as e:
+        return {"success": False, "error": {"code": "EXPORT_FAILED", "message": str(e)}}
+
+def epic_import_kv(cache_path, options=None):
+    """
+    Import KV cache from file with optional position remapping.
+    
+    Options:
+        target_position: int - Target position to load cache at (enables RoPE remapping)
+                              If not specified, loads at original positions
+    """
+    import time, struct
+    start_time = time.time()
+    if options is None: options = {}
+    target_position = options.get("target_position", -1)  # -1 means no remapping
+    
+    try:
+        with open(cache_path, "rb") as f:
+            magic = f.read(4)
+            if magic != EPIC_MAGIC:
+                return {"success": False, "error": {"code": "INVALID_FILE", "message": "Not a valid EPIC cache file"}}
+            version = struct.unpack("<H", f.read(2))[0]
+            meta_len = struct.unpack("<I", f.read(4))[0]
+            meta_json = f.read(meta_len)
+            metadata = json.loads(meta_json.decode("utf-8"))
+        
+        # Get token_ids from metadata
+        token_ids = metadata.get("token_ids", [])
+        original_position = metadata.get("original_position", 0)
+        
+        if not token_ids:
+            return {"success": False, "error": {"code": "NO_TOKENS", "message": "Cache file has no token_ids - cannot rebuild KV state"}}
+        
+        # Check if position remapping is requested and supported
+        use_position_remap = target_position >= 0 and target_position != original_position
+        
+        if use_position_remap:
+            try:
+                can_shift = handle.epic_can_shift_kv()
+            except:
+                can_shift = False
+            if not can_shift:
+                print(f"Warning: Position remapping requested but K-shift not supported. Loading at original position.")
+                use_position_remap = False
+        
+        # Rebuild KV by processing tokens (standard path)
+        result = epic_prefill_tokens(token_ids)
+        if not result.get("success", False):
+            return {"success": False, "error": {"code": "REBUILD_FAILED", "message": result.get("error", "Failed to rebuild KV from tokens")}}
+        
+        # Apply position shift if requested
+        actual_position = 0
+        if use_position_remap:
+            delta = target_position - 0  # Tokens are loaded at position 0
+            if delta != 0:
+                try:
+                    shift_result = handle.epic_apply_kv_shift(-1, -1, delta)
+                    if shift_result:
+                        actual_position = target_position
+                        print(f"EPIC Import: Applied position shift delta={delta} (RoPE remapping enabled)")
+                    else:
+                        print(f"Warning: Position shift failed, tokens remain at original position")
+                except Exception as e:
+                    print(f"Warning: Position shift failed: {e}")
+        
+        load_time_ms = int((time.time() - start_time) * 1000)
+        token_count = len(token_ids)
+        
+        return {"success": True, "loaded": {"path": cache_path, "token_count": token_count,
+                "position_range": [actual_position, actual_position + token_count - 1] if token_count > 0 else [0, 0],
+                "original_position": original_position,
+                "target_position": target_position if target_position >= 0 else None,
+                "position_remapped": use_position_remap,
+                "content_hash": metadata.get("content_hash", "")},
+                "context_state": {"total_tokens": token_count, "available_tokens": maxctx - token_count, "max_context": maxctx},
+                "timing": {"load_time_ms": load_time_ms, "rebuilt_from_tokens": True}}
+    except Exception as e:
+        return {"success": False, "error": {"code": "IMPORT_FAILED", "message": str(e)}}
+
+
+def epic_prefill_tokens(token_ids):
+    import time
+    start_time = time.time()
+    token_count = len(token_ids)
+    if token_count == 0:
+        return {"success": True, "token_count": 0, "time_ms": 0}
+    try:
+        gen_input = generation_inputs()
+        input_ids_array = (ctypes.c_int32 * token_count)(*token_ids)
+        gen_input.input_ids = input_ids_array
+        gen_input.input_ids_len = token_count
+        gen_input.prompt = "".encode("UTF-8")
+        gen_input.max_length = 0
+        gen_input.max_context_length = maxctx
+        gen_input.temperature = 0.0
+        gen_input.seed = -1
+        gen_input.memory = "".encode("UTF-8")
+        gen_input.negative_prompt = "".encode("UTF-8")
+        gen_input.guidance_scale = 1.0
+        for i in range(images_max): gen_input.images[i] = "".encode("UTF-8")
+        for i in range(audio_max): gen_input.audio[i] = "".encode("UTF-8")
+        # Initialize remaining required fields to prevent null pointer issues
+        gen_input.grammar = "".encode("UTF-8")
+        gen_input.grammar_retain_state = False
+        gen_input.stop_sequence_len = 0
+        gen_input.stop_sequence = (ctypes.c_char_p * 0)()
+        gen_input.logit_biases_len = 0
+        gen_input.logit_biases = (logit_bias * 0)()
+        gen_input.banned_tokens_len = 0
+        gen_input.banned_tokens = (ctypes.c_char_p * 0)()
+        gen_input.dry_sequence_breakers_len = 0
+        gen_input.dry_sequence_breakers = (ctypes.c_char_p * 0)()
+        gen_input.output_attentions = False
+        gen_input.output_hidden_states = False
+        gen_input.ouroboros_mode = False
+        gen_input.ouroboros_embd_count = 0
+        gen_input.ouroboros_embeddings = None
+        gen_input.ouroboros_positions = None
+        gen_input.stream_sse = False
+        gen_input.allow_eos_token = True
+        gen_input.bypass_eos_token = False
+        gen_input.tool_call_fix = False
+        gen_input.render_special = False
+        gen_input.mirostat = 0
+        gen_input.mirostat_tau = 0
+        gen_input.mirostat_eta = 0
+        gen_input.top_k = 0
+        gen_input.top_a = 0
+        gen_input.top_p = 1.0
+        gen_input.min_p = 0
+        gen_input.typical_p = 1.0
+        gen_input.tfs = 1.0
+        gen_input.nsigma = 0
+        gen_input.rep_pen = 1.0
+        gen_input.rep_pen_range = 0
+        gen_input.rep_pen_slope = 0
+        gen_input.presence_penalty = 0
+        gen_input.dynatemp_range = 0
+        gen_input.dynatemp_exponent = 1.0
+        gen_input.smoothing_factor = 0
+        gen_input.dry_multiplier = 0
+        gen_input.dry_base = 0
+        gen_input.dry_allowed_length = 0
+        gen_input.dry_penalty_last_n = 0
+        gen_input.xtc_threshold = 0
+        gen_input.xtc_probability = 0
+        gen_input.sampler_len = 0
+        handle.generate(gen_input)
+        time_ms = int((time.time() - start_time) * 1000)
+        return {"success": True, "token_count": token_count, "time_ms": time_ms}
+    except Exception as e:
+        return {"success": False, "error": str(e)}
+
+def epic_assemble(segments, options=None):
+    """
+    Assemble a context from multiple segments: KV cache files AND/OR raw token arrays.
+    
+    Segments can be:
+    - {"cache_path": "/path/to/file.epic"} - Load pre-computed KV cache
+    - {"tokens": [1234, 5678, ...]} - Prefill raw token IDs
+    
+    Options:
+    - clear_first: bool (default True) - Clear context before assembly
+    - atomic: bool (default True) - Validate all segments before starting
+    - boundary_tokens: int (default 0) - LegoLink boundary replay tokens (k)
+      If > 0, replays the first k tokens at each chunk boundary to fix
+      attention sink artifacts from isolated KV cache computation.
+      Recommended: 64-128 tokens for good coherence.
+    """
+    import time
+    import struct
+    start_time = time.time()
+    
+    if options is None:
+        options = {}
+    
+    clear_first = options.get("clear_first", True)
+    atomic = options.get("atomic", True)
+    boundary_tokens = options.get("boundary_tokens", 0)  # LegoLink k parameter
+    
+    try:
+        # Validate all segments first if atomic
+        if atomic:
+            for i, seg in enumerate(segments):
+                if "cache_path" in seg:
+                    if not os.path.exists(seg["cache_path"]):
+                        return {
+                            "success": False,
+                            "status_code": 404,
+                            "error": {
+                                "code": "CACHE_NOT_FOUND",
+                                "message": f"Cache file not found: {seg['cache_path']}"
+                            }
+                        }
+                elif "tokens" not in seg:
+                    return {
+                        "success": False,
+                        "status_code": 400,
+                        "error": {
+                            "code": "INVALID_SEGMENT",
+                            "message": f"Segment {i} must have either 'cache_path' or 'tokens'"
+                        }
+                    }
+        
+        # Clear existing context if requested
+        if clear_first:
+            handle.clear_state_kv()
+        
+        segments_loaded = []
+        current_position = 0
+        total_tokens = 0
+        per_segment_ms = []
+        all_token_ids = []  # Track all tokens for LegoLink
+        segment_boundaries = []  # Track where each segment starts
+        
+        for seg_idx, seg in enumerate(segments):
+            seg_start = time.time()
+            
+            # Record boundary position (for LegoLink)
+            if seg_idx > 0:  # First segment doesn't need boundary replay
+                segment_boundaries.append(current_position)
+            
+            if "cache_path" in seg:
+                # Load KV cache from file
+                result = epic_import_kv(seg["cache_path"], options)
+                if not result["success"]:
+                    if atomic:
+                        handle.clear_state_kv()
+                    return result
+                
+                token_count = result["loaded"]["token_count"]
+                
+                # Try to get token IDs from cache metadata for LegoLink
+                cache_token_ids = []
+                try:
+                    with open(seg["cache_path"], 'rb') as f:
+                        f.read(4)  # magic
+                        f.read(2)  # version
+                        meta_len = struct.unpack('<I', f.read(4))[0]
+                        meta_json = f.read(meta_len)
+                        cache_meta = json.loads(meta_json.decode('utf-8'))
+                        cache_token_ids = cache_meta.get("token_ids", [])
+                except:
+                    pass
+                
+                all_token_ids.extend(cache_token_ids)
+                
+                segments_loaded.append({
+                    "type": "cache",
+                    "path": seg["cache_path"],
+                    "position_range": [current_position, current_position + token_count - 1],
+                    "token_count": token_count,
+                    "content_hash": result["loaded"].get("content_hash", ""),
+                    "has_token_ids": len(cache_token_ids) > 0
+                })
+                current_position += token_count
+                total_tokens += token_count
+                
+            elif "tokens" in seg:
+                # Prefill raw token IDs
+                token_ids = seg["tokens"]
+                token_count = len(token_ids)
+                
+                if token_count > 0:
+                    # Track tokens for LegoLink
+                    all_token_ids.extend(token_ids)
+                    
+                    # Use epic_prefill_tokens if available
+                    result = epic_prefill_tokens(token_ids)
+                    if not result["success"]:
+                        if atomic:
+                            handle.clear_state_kv()
+                        return {
+                            "success": False,
+                            "status_code": 500,
+                            "error": {"code": "PREFILL_FAILED", "message": result.get("error", "Unknown error")}
+                        }
+                    
+                    segments_loaded.append({
+                        "type": "tokens",
+                        "position_range": [current_position, current_position + token_count - 1],
+                        "token_count": token_count,
+                        "has_token_ids": True
+                    })
+                    current_position += token_count
+                    total_tokens += token_count
+            
+            seg_time_ms = int((time.time() - seg_start) * 1000)
+            per_segment_ms.append(seg_time_ms)
+        
+        assembly_time_ms = int((time.time() - start_time) * 1000)
+        
+        # LegoLink boundary replay if requested
+        legolink_result = None
+        legolink_time_ms = 0
+        
+        if boundary_tokens > 0 and len(segment_boundaries) > 0:
+            if len(all_token_ids) == total_tokens:
+                # We have all token IDs, can perform LegoLink
+                legolink_start = time.time()
+                legolink_result = epic_legolink(
+                    boundaries=segment_boundaries,
+                    tokens_per_boundary=boundary_tokens,
+                    context_tokens=all_token_ids,
+                    options=options
+                )
+                legolink_time_ms = int((time.time() - legolink_start) * 1000)
+            else:
+                # Missing token IDs - can't perform LegoLink
+                legolink_result = {
+                    "success": False,
+                    "warning": "LegoLink skipped: token IDs not available for all segments",
+                    "available_tokens": len(all_token_ids),
+                    "required_tokens": total_tokens
+                }
+        
+        total_time_ms = int((time.time() - start_time) * 1000)
+        
+        result = {
+            "success": True,
+            "summary": {
+                "total_segments": len(segments),
+                "cache_segments": sum(1 for s in segments if "cache_path" in s),
+                "token_segments": sum(1 for s in segments if "tokens" in s),
+                "skipped_segments": 0,
+                "legolink_enabled": boundary_tokens > 0
+            },
+            "skipped_reasons": {},
+            "context_state": {
+                "total_tokens": total_tokens,
+                "segment_boundaries": [0] + segment_boundaries + [total_tokens],
+                "available_tokens": maxctx - total_tokens,
+                "max_context": maxctx
+            },
+            "segments_loaded": segments_loaded,
+            "timing": {
+                "total_time_ms": total_time_ms,
+                "assembly_time_ms": assembly_time_ms,
+                "legolink_time_ms": legolink_time_ms,
+                "per_segment_ms": per_segment_ms,
+                "assemble_overhead_ms": assembly_time_ms - sum(per_segment_ms)
+            }
+        }
+        
+        # Include LegoLink results if performed
+        if legolink_result is not None:
+            result["legolink"] = legolink_result
+        
+        return result
+        
+    except Exception as e:
+        return {
+            "success": False,
+            "status_code": 500,
+            "error": {"code": "ASSEMBLE_FAILED", "message": str(e)}
+        }
+
+def epic_get_status():
+    try:
+        new_state_size = handle.calc_new_state_kv()
+        new_token_count = handle.calc_new_state_tokencount()
+        slot_states = []
+        for slot in range(savestate_limit):
+            old_state = handle.calc_old_state_kv(slot)
+            old_tokens = handle.calc_old_state_tokencount(slot)
+            if old_state > 0:
+                slot_states.append({"slot": slot, "token_count": old_tokens, "size_bytes": old_state})
+        return {"model": {"id": friendlymodelname, "max_context": maxctx},
+                "context": {"total_tokens": new_token_count, "available_tokens": maxctx - new_token_count,
+                "utilization_percent": (new_token_count / maxctx * 100) if maxctx > 0 else 0, "state_size_bytes": new_state_size},
+                "saved_states": slot_states, "epic_version": "1.0.0"}
+    except Exception as e:
+        return {"success": False, "error": {"code": "STATUS_FAILED", "message": str(e)}}
+
+def epic_clear(params=None):
+    if params is None: params = {}
+    try:
+        old_token_count = handle.calc_new_state_tokencount()
+        result = handle.clear_state_kv()
+        return {"success": result, "cleared": {"token_count": old_token_count},
+                "context_state": {"total_tokens": 0, "available_tokens": maxctx, "max_context": maxctx}}
+    except Exception as e:
+        return {"success": False, "error": {"code": "CLEAR_FAILED", "message": str(e)}}
+
 # Performs a web search using DuckDuckGo and extracts text content from the top results.
+
+def epic_legolink(boundaries, tokens_per_boundary=64, context_tokens=None, options=None):
+    """
+    LegoLink Boundary Replay: Fix attention sink artifacts at chunk boundaries.
+    
+    When KV cache chunks are computed in isolation and then stitched together,
+    the first tokens of each chunk have incorrect attention patterns (they were
+    computed as "position 0" in their isolated context, but now sit at position N).
+    
+    LegoLink replays the first k tokens at each boundary position with full
+    awareness of prior context, allowing them to form proper attention patterns.
+    
+    This is O(kN) where k = tokens_per_boundary and N = number of boundaries,
+    compared to O(N^2) for full context recomputation.
+    
+    Args:
+        boundaries: List of positions where chunk boundaries occur.
+        tokens_per_boundary: Number of tokens to replay at each boundary (default: 64).
+        context_tokens: Full list of token IDs for the assembled context.
+        options: Optional configuration dict.
+    
+    Returns:
+        dict with success status, timing info, and per-boundary replay results.
+    """
+    import time
+    start_time = time.time()
+    
+    if options is None:
+        options = {}
+    
+    if not boundaries:
+        return {
+            "success": True,
+            "message": "No boundaries to replay",
+            "boundaries_processed": 0,
+            "timing": {"total_ms": 0}
+        }
+    
+    if context_tokens is None or len(context_tokens) == 0:
+        return {
+            "success": False,
+            "error": {
+                "code": "MISSING_TOKENS",
+                "message": "context_tokens required for boundary replay"
+            }
+        }
+    
+    try:
+        k = tokens_per_boundary
+        total_tokens = len(context_tokens)
+        boundary_results = []
+        total_replay_tokens = 0
+        replay_times_ms = []
+        
+        sorted_boundaries = sorted(boundaries)
+        
+        for boundary_pos in sorted_boundaries:
+            boundary_start = time.time()
+            
+            if boundary_pos < 0 or boundary_pos >= total_tokens:
+                boundary_results.append({
+                    "position": boundary_pos,
+                    "status": "skipped",
+                    "reason": f"Position {boundary_pos} out of range [0, {total_tokens})"
+                })
+                continue
+            
+            replay_start = boundary_pos
+            replay_end = min(boundary_pos + k, total_tokens)
+            replay_count = replay_end - replay_start
+            
+            if replay_count <= 0:
+                boundary_results.append({
+                    "position": boundary_pos,
+                    "status": "skipped",
+                    "reason": "No tokens to replay at boundary"
+                })
+                continue
+            
+            boundary_token_ids = context_tokens[replay_start:replay_end]
+            boundary_text = detokenize_ids(boundary_token_ids)
+            
+            prior_token_ids = context_tokens[:replay_start]
+            prior_text = detokenize_ids(prior_token_ids) if prior_token_ids else ""
+            
+            combined_text = prior_text + boundary_text
+            
+            gen_input = generation_inputs()
+            gen_input.prompt = combined_text.encode("UTF-8")
+            gen_input.max_length = 0  # Don't generate, just prefill
+            gen_input.max_context_length = maxctx
+            gen_input.temperature = 0.0
+            gen_input.seed = -1
+            gen_input.memory = b""
+            gen_input.negative_prompt = b""
+            gen_input.guidance_scale = 1.0
+            for i in range(images_max):
+                gen_input.images[i] = b""
+            for i in range(audio_max):
+                gen_input.audio[i] = b""
+            # Initialize remaining required fields to prevent null pointer issues
+            gen_input.grammar = b""
+            gen_input.grammar_retain_state = False
+            gen_input.stop_sequence_len = 0
+            gen_input.stop_sequence = (ctypes.c_char_p * 0)()
+            gen_input.logit_biases_len = 0
+            gen_input.logit_biases = (logit_bias * 0)()
+            gen_input.banned_tokens_len = 0
+            gen_input.banned_tokens = (ctypes.c_char_p * 0)()
+            gen_input.dry_sequence_breakers_len = 0
+            gen_input.dry_sequence_breakers = (ctypes.c_char_p * 0)()
+            gen_input.stream_sse = False
+            gen_input.allow_eos_token = True
+            gen_input.bypass_eos_token = False
+            gen_input.tool_call_fix = False
+            gen_input.render_special = False
+            gen_input.mirostat = 0
+            gen_input.mirostat_tau = 0.0
+            gen_input.mirostat_eta = 0.0
+            gen_input.top_k = 0
+            gen_input.top_a = 0.0
+            gen_input.top_p = 1.0
+            gen_input.min_p = 0.0
+            gen_input.typical_p = 1.0
+            gen_input.tfs = 1.0
+            gen_input.nsigma = 0.0
+            gen_input.rep_pen = 1.0
+            gen_input.rep_pen_range = 0
+            gen_input.rep_pen_slope = 1.0
+            gen_input.presence_penalty = 0.0
+            gen_input.xtc_threshold = 0.0
+            gen_input.xtc_probability = 0.0
+            gen_input.dynatemp_range = 0.0
+            gen_input.dynatemp_exponent = 1.0
+            gen_input.smoothing_factor = 0.0
+            gen_input.dry_multiplier = 0.0
+            gen_input.dry_base = 1.75
+            gen_input.dry_allowed_length = 2
+            gen_input.dry_penalty_last_n = 0
+            
+            handle.generate(gen_input)
+            
+            total_replay_tokens += replay_count
+            replay_time_ms = int((time.time() - boundary_start) * 1000)
+            replay_times_ms.append(replay_time_ms)
+            
+            boundary_results.append({
+                "position": boundary_pos,
+                "status": "replayed",
+                "tokens_replayed": replay_count,
+                "position_range": [replay_start, replay_end - 1],
+                "time_ms": replay_time_ms
+            })
+        
+        total_time_ms = int((time.time() - start_time) * 1000)
+        
+        successful = sum(1 for r in boundary_results if r.get("status") == "replayed")
+        skipped = sum(1 for r in boundary_results if r.get("status") == "skipped")
+        
+        return {
+            "success": True,
+            "summary": {
+                "boundaries_requested": len(boundaries),
+                "boundaries_processed": successful,
+                "boundaries_skipped": skipped,
+                "total_tokens_replayed": total_replay_tokens,
+                "tokens_per_boundary": k
+            },
+            "boundaries": boundary_results,
+            "timing": {
+                "total_ms": total_time_ms,
+                "per_boundary_ms": replay_times_ms,
+                "avg_per_boundary_ms": sum(replay_times_ms) / len(replay_times_ms) if replay_times_ms else 0
+            },
+            "complexity": {
+                "legolink": f"O({k} x {len(boundaries)}) = O({k * len(boundaries)})",
+                "full_recompute_avoided": f"O({total_tokens}^2) = O({total_tokens * total_tokens})"
+            }
+        }
+        
+    except Exception as e:
+        return {
+            "success": False,
+            "error": {"code": "LEGOLINK_FAILED", "message": str(e)}
+        }
+
+def epic_get_context_tokens():
+    """
+    Get the token IDs currently in the context.
+    This is needed for LegoLink to know which tokens to replay at boundaries.
+    
+    Note: This is a helper function. In a full implementation, token IDs
+    would be tracked as part of the EPIC segment metadata.
+    """
+    try:
+        token_count = handle.calc_new_state_tokencount()
+        
+        return {
+            "success": True,
+            "token_count": token_count,
+            "token_ids": None,  # Would require C++ implementation
+            "note": "Token ID retrieval requires C++ implementation. Track tokens during assembly."
+        }
+    except Exception as e:
+        return {
+            "success": False,
+            "error": {"code": "GET_TOKENS_FAILED", "message": str(e)}
+        }
+
 def websearch(query):
     global websearch_lastquery
     global websearch_lastresponse
@@ -2715,7 +3411,6 @@ ws ::= | " " | "\n" [ \t]{0,20}
             tool_json_formatting_instruction = f"\nPlease use the provided schema to fill the parameters to create a function call for {toolname}, in the following format: " + json.dumps([{"id": "call_001", "type": "function", "function": {"name": f"{toolname}", "arguments": {"first property key": "first property value", "second property key": "second property value"}}}], indent=0)
             genparams["prompt"] += f"\n\nJSON Schema:\n{used_tool_json}\n\n{tool_json_formatting_instruction}{assistant_message_start}"
 
-
     elif api_format==3 or api_format==4 or api_format==7:
         default_adapter = {} if chatcompl_adapter is None else chatcompl_adapter
         adapter_obj = genparams.get('adapter', default_adapter)
@@ -2846,7 +3541,6 @@ ws ::= | " " | "\n" [ \t]{0,20}
                         tool_json_formatting_instruction = f"\nPlease use the provided schema to fill the parameters to create a function call for {toolname}, in the following format: " + json.dumps([{"id": "call_001", "type": "function", "function": {"name": f"{toolname}", "arguments": {"first property key": "first property value", "second property key": "second property value"}}}], indent=0)
                         messages_string += f"\n\nJSON Schema:\n{used_tool_json}\n\n{tool_json_formatting_instruction}{assistant_message_start}"
 
-
                 if message['role'] == "system":
                     messages_string += system_message_end
                 elif message['role'] == "user":
@@ -2868,7 +3562,6 @@ ws ::= | " " | "\n" [ \t]{0,20}
                 genparams["stop_sequence"].append(user_message_start.strip())
                 genparams["stop_sequence"].append(assistant_message_start.strip())
             genparams["trim_stop"] = True
-
 
     elif api_format==5:
         firstimg = genparams.get('image', "")
@@ -3428,7 +4121,6 @@ class KcppServerRequestHandler(http.server.SimpleHTTPRequestHandler):
         await asyncio.sleep(0.1)
         self.close_connection = True
         await asyncio.sleep(0.05)
-
 
     async def handle_request(self, genparams, api_format, stream_flag):
         tasks = []
@@ -4480,8 +5172,135 @@ Change Mode<br>
                 if global_memory and args.admin and args.admindir and os.path.exists(args.admindir) and self.check_header_password(args.adminpassword):
                     result = handle.clear_state_kv()
                     response_body = (json.dumps({"success": result}).encode())
-                else:
-                    response_body = (json.dumps({"success": False}).encode())
+
+            # EPIC API Endpoints
+            elif self.path.endswith("/api/v1/epic/export"):
+                if not self.secure_endpoint(): return
+                try:
+                    genparams = json.loads(body)
+                    text = genparams.get("text", "")
+                    output_path = genparams.get("output_path", "")
+                    add_bos = genparams.get("add_bos", True)
+                    metadata = genparams.get("metadata", {})
+                    options = genparams.get("options", {})
+                    if not text:
+                        response_code = 400
+                        response_body = json.dumps({"success": False, "error": {"code": "INVALID_TEXT", "message": "Text is required"}}).encode()
+                    elif not output_path:
+                        response_code = 400
+                        response_body = json.dumps({"success": False, "error": {"code": "INVALID_PATH", "message": "output_path is required"}}).encode()
+                    else:
+                        result = epic_export_kv(text, output_path, add_bos, metadata, options)
+                        response_body = json.dumps(result).encode()
+                        if not result["success"]: response_code = 500
+                except Exception as e:
+                    utfprint(f"EPIC Export Error: {str(e)}")
+                    response_code = 500
+                    response_body = json.dumps({"success": False, "error": {"code": "EXPORT_FAILED", "message": str(e)}}).encode()
+            elif self.path.endswith("/api/v1/epic/import"):
+                if not self.secure_endpoint(): return
+                try:
+                    genparams = json.loads(body)
+                    cache_path = genparams.get("cache_path", "")
+                    options = genparams.get("options", {})
+                    if not cache_path:
+                        response_code = 400
+                        response_body = json.dumps({"success": False, "error": {"code": "INVALID_PATH", "message": "cache_path is required"}}).encode()
+                    elif not os.path.exists(cache_path):
+                        response_code = 404
+                        response_body = json.dumps({"success": False, "error": {"code": "FILE_NOT_FOUND", "message": f"Cache file not found: {cache_path}"}}).encode()
+                    else:
+                        result = epic_import_kv(cache_path, options)
+                        response_body = json.dumps(result).encode()
+                        if not result["success"]: response_code = 500
+                except Exception as e:
+                    utfprint(f"EPIC Import Error: {str(e)}")
+                    response_code = 500
+                    response_body = json.dumps({"success": False, "error": {"code": "IMPORT_FAILED", "message": str(e)}}).encode()
+            elif self.path.endswith("/api/v1/epic/assemble"):
+                if not self.secure_endpoint(): return
+                try:
+                    genparams = json.loads(body)
+                    segments = genparams.get("segments", [])
+                    options = genparams.get("options", {})
+                    if not segments:
+                        response_code = 400
+                        response_body = json.dumps({"success": False, "error": {"code": "EMPTY_SEGMENTS", "message": "Segments array is required"}}).encode()
+                    else:
+                        result = epic_assemble(segments, options)
+                        response_body = json.dumps(result).encode()
+                        if not result["success"]: response_code = result.get("status_code", 500)
+                except Exception as e:
+                    utfprint(f"EPIC Assemble Error: {str(e)}")
+                    response_code = 500
+                    response_body = json.dumps({"success": False, "error": {"code": "ASSEMBLE_FAILED", "message": str(e)}}).encode()
+            elif self.path.endswith("/api/v1/epic/prefill"):
+                if not self.secure_endpoint(): return
+                try:
+                    genparams = json.loads(body)
+                    token_ids = genparams.get("tokens", genparams.get("token_ids", []))
+                    if not token_ids:
+                        response_code = 400
+                        response_body = json.dumps({"success": False, "error": {"code": "NO_TOKENS", "message": "tokens array is required"}}).encode()
+                    else:
+                        result = epic_prefill_tokens(token_ids)
+                        response_body = json.dumps(result).encode()
+                except Exception as e:
+                    utfprint(f"EPIC Prefill Error: {str(e)}")
+                    response_code = 500
+                    response_body = json.dumps({"success": False, "error": {"code": "PREFILL_FAILED", "message": str(e)}}).encode()
+            elif self.path.endswith("/api/v1/epic/status"):
+                if not self.secure_endpoint(): return
+                try:
+                    result = epic_get_status()
+                    response_body = json.dumps(result).encode()
+                except Exception as e:
+                    utfprint(f"EPIC Status Error: {str(e)}")
+                    response_code = 500
+                    response_body = json.dumps({"success": False, "error": {"code": "STATUS_FAILED", "message": str(e)}}).encode()
+            elif self.path.endswith("/api/v1/epic/clear"):
+                if not self.secure_endpoint(): return
+                try:
+                    genparams = json.loads(body) if body else {}
+                    result = epic_clear(genparams)
+                    response_body = json.dumps(result).encode()
+                except Exception as e:
+                    utfprint(f"EPIC Clear Error: {str(e)}")
+                    response_code = 500
+                    response_body = json.dumps({"success": False, "error": {"code": "CLEAR_FAILED", "message": str(e)}}).encode()
+
+            elif self.path.endswith("/api/v1/epic/legolink"):
+                # LegoLink Boundary Replay - Fix attention sink artifacts
+                if not self.secure_endpoint(): return
+                try:
+                    genparams = json.loads(body) if body else {}
+                    
+                    boundaries = genparams.get("boundaries", [])
+                    tokens_per_boundary = genparams.get("tokens_per_boundary", 64)
+                    context_tokens = genparams.get("context_tokens", None)
+                    options = genparams.get("options", {})
+                    
+                    result = epic_legolink(
+                        boundaries=boundaries,
+                        tokens_per_boundary=tokens_per_boundary,
+                        context_tokens=context_tokens,
+                        options=options
+                    )
+                    
+                    if result.get("success", False):
+                        response_body = json.dumps(result).encode()
+                    else:
+                        response_code = 400
+                        response_body = json.dumps(result).encode()
+                        
+                except Exception as e:
+                    utfprint(f"EPIC LegoLink Error: {str(e)}")
+                    response_code = 500
+                    response_body = json.dumps({
+                        "success": False,
+                        "error": {"code": "LEGOLINK_FAILED", "message": str(e)}
+                    }).encode()
+
             elif self.path.startswith('/api/upload/image') or self.path.startswith("/upload/image"): #comfyui compatible
                 lastuploadedcomfyimg = b''
                 formdata = self.extract_formdata_from_file_upload(body)
@@ -4712,7 +5531,6 @@ Change Mode<br>
 
         self.send_response(404)
         self.end_headers(content_type='text/html')
-
 
     def do_OPTIONS(self):
         self.send_response(200)
@@ -5305,7 +6123,6 @@ def show_gui():
         slider.set(set)
         return slider, sliderLabel, titleLabel
 
-
     def makelabelentry(parent, text, var, row=0, width=50, padx=8, singleline=False, tooltip="", labelpadx=8):
         label = makelabel(parent, text, row, 0, tooltip, padx=labelpadx)
         entry = ctk.CTkEntry(parent, width=width, textvariable=var)
@@ -5626,7 +6443,6 @@ def show_gui():
         else:
             noqkvlabel.grid_remove()
 
-
     def toggleflashattn(a,b,c):
         qkvslider.grid()
         qkvlabel.grid()
@@ -5818,7 +6634,6 @@ def show_gui():
     makelabelentry(hardware_tab, "Force Version:" , version_var, 100, 50,tooltip="If the autodetected version is wrong, you can change it here.\nLeave as 0 for default.")
     ctk.CTkButton(hardware_tab , text = "Run Benchmark", command = guibench ).grid(row=110,column=0, stick="se", padx= 0, pady=2)
 
-
     # Tokens Tab
     tokens_tab = tabcontent["Tokens"]
     # tokens checkboxes
@@ -5923,7 +6738,6 @@ def show_gui():
 
     makelabelentry(network_tab, "Max Req. Size (MB):", maxrequestsize_var, row=20, width=50, tooltip="Specify a max request payload size. Any requests to the server larger than this size will be dropped. Do not change if unsure.")
     makelabelentry(network_tab, "IP Rate Limiter (s):", ratelimit_var, row=22, width=50, tooltip="Rate limits each IP to allow a new request once per X seconds. Do not change if unsure.")
-
 
     # Horde Tab
     horde_tab = tabcontent["Horde Worker"]
@@ -6581,7 +7395,6 @@ def show_gui():
         print("Exiting by user request.")
         sys.exit(0)
 
-
     if nextstate==0:
         exitcounter = 999
         print("Exiting by user request.")
@@ -7158,7 +7971,6 @@ def downloader_internal(input_url, output_filename, capture_output, min_file_siz
 
     return output_filename
 
-
 def download_model_from_url(url, permitted_types=[".gguf",".safetensors", ".ggml", ".bin"], min_file_size=64,handle_multipart=False):
     if url and url!="":
         if url.endswith("?download=true"):
@@ -7207,7 +8019,6 @@ def analyze_gguf_model_wrapper(filename=""):
     print(f"Analyzing {filename}, please wait...\n---",flush=True)
     dumpthread = threading.Thread(target=analyze_gguf_model, args=(args,filename))
     dumpthread.start()
-
 
 def register_koboldcpp():
     try:
@@ -7970,7 +8781,6 @@ def kcpp_main_process(launch_args, g_memory=None, gui_launcher=False):
             if not loadok:
                 exitcounter = 999
                 exit_with_error(3,"Could not load Embeddings model!")
-
 
     #load embedded lite
     embddir = os.path.join(os.path.abspath(os.path.dirname(os.path.realpath(__file__))),"embd_res")

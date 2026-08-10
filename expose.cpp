@@ -561,6 +561,39 @@ extern "C"
         return ouroboros_get_position(index);
     }
 
+    // EPIC/Halo Weave: KV Cache Export API
+    bool epic_prefill_and_export_kv(const char* text, const char* output_path, bool add_bos)
+    {
+        return gpttype_prefill_and_export_kv(text, output_path, add_bos);
+    }
+
+    bool epic_load_kv_from_file(const char* input_path)
+    {
+        return gpttype_load_kv_from_file(input_path);
+    }
+
+
+    // EPIC Position Remapping API - RoPE-aware KV cache operations (Halo Weave)
+    bool epic_import_kv_with_remap(const char* input_path, int target_position)
+    {
+        return gpttype_import_kv_with_position_remap(input_path, target_position);
+    }
+
+    void epic_get_kv_position_info(int* pos_min, int* pos_max, int* used_cells)
+    {
+        gpttype_get_kv_position_info(pos_min, pos_max, used_cells);
+    }
+
+    bool epic_apply_kv_shift(int pos_start, int pos_end, int delta)
+    {
+        return gpttype_apply_kv_position_shift(pos_start, pos_end, delta);
+    }
+
+    bool epic_can_shift_kv()
+    {
+        return gpttype_can_shift_kv();
+    }
+
     int ouroboros_n_embd()
     {
         return ouroboros_get_n_embd();

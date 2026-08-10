@@ -450,3 +450,7 @@ const float* ouroboros_get_embedding(int index);
 int ouroboros_get_token_id(int index);
 int ouroboros_get_position(int index);
 int ouroboros_get_n_embd();
+
+// EPIC/Halo Weave: KV Cache Export for Position-Independent Caching
+bool gpttype_prefill_and_export_kv(const char* text, const char* output_path, bool add_bos);
+bool gpttype_load_kv_from_file(const char* input_path);
